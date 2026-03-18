@@ -391,23 +391,43 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
                       f'mean_est_dp={mean_dp:.4f} ± {np.std(est_dps):.4f}  '
                       f'mean_abs_err={mean_abs:.4f}', flush=True)
 
-        # ── Mode 3: Global audit (full dataset → this target) ─────────────────
-        r_global = run_single_audit(model, dataset, global_indices,
-                                    global_gender, true_dp, device)
-        _add_gt_errors(r_global, true_dp_data, true_dp_model_full)
-        r_global.update({
-            'mode'      : 'global',
-            'auditor_id': 'global',
+        # ── Mode 3: Global audit ──────────────────────────────────────────────
+        # 3a. global_all  — full dataset (162K images, includes target's own data)
+        r_global_all = run_single_audit(model, dataset, global_indices,
+                                        global_gender, true_dp, device)
+        _add_gt_errors(r_global_all, true_dp_data, true_dp_model_full)
+        r_global_all.update({
+            'mode'      : 'global_all',
+            'auditor_id': 'global_all',
             'target_id' : target_id,
         })
-        print(f'{tag} Global      | '
-              f'est_dp={r_global["est_dp_gap"]:.4f}  '
-              f'abs_err={r_global["abs_error"]:.4f}', flush=True)
+        print(f'{tag} Global (all)  | '
+              f'est_dp={r_global_all["est_dp_gap"]:.4f}  '
+              f'abs_err={r_global_all["abs_error"]:.4f}', flush=True)
+
+        # 3b. global_excl — full dataset minus target's own partition
+        excl_mask            = np.ones(N, dtype=bool)
+        excl_mask[node_indices[target_id - 1]] = False
+        global_excl_indices  = np.where(excl_mask)[0]
+        global_excl_gender   = global_gender[excl_mask]
+        r_global_excl = run_single_audit(model, dataset, global_excl_indices,
+                                         global_excl_gender, true_dp, device)
+        _add_gt_errors(r_global_excl, true_dp_data, true_dp_model_full)
+        r_global_excl.update({
+            'mode'      : 'global_excl',
+            'auditor_id': 'global_excl',
+            'target_id' : target_id,
+        })
+        print(f'{tag} Global (excl) | '
+              f'n_queries={len(global_excl_indices):,}  '
+              f'est_dp={r_global_excl["est_dp_gap"]:.4f}  '
+              f'abs_err={r_global_excl["abs_error"]:.4f}', flush=True)
 
         result_queue.put(('success', target_id, {
-            'full'  : full_results,
-            'budget': budget_results,
-            'global': r_global,
+            'full'        : full_results,
+            'budget'      : budget_results,
+            'global_all'  : r_global_all,
+            'global_excl' : r_global_excl,
         }))
 
     except Exception as e:
@@ -607,13 +627,14 @@ def plot_budget_error_vs_mismatch(budget_results, node_stats, plot_dir):
     return out
 
 
-def plot_global_vs_local(full_results, global_results, plot_dir):
+def plot_global_vs_local(full_results, global_all_results, global_excl_results, plot_dir):
     """
-    For each target node: compare global audit estimate vs all local
-    auditor estimates. Shows whether a global auditor is better/worse
-    than local auditors.
+    For each target node: compare both global audit variants vs all local
+    auditor estimates.
+      global_all  — queries include target's own training data
+      global_excl — queries exclude target's own training data
     """
-    target_ids = sorted(set(r['target_id'] for r in global_results))
+    target_ids = sorted(set(r['target_id'] for r in global_all_results))
     n_targets  = len(target_ids)
 
     fig, axes = plt.subplots(1, n_targets, figsize=(4 * n_targets, 5),
@@ -624,30 +645,32 @@ def plot_global_vs_local(full_results, global_results, plot_dir):
                  fontsize=13, fontweight='bold')
 
     for ax, target_id in zip(axes, target_ids):
-        # Local estimates for this target
         local = [r for r in full_results if r['target_id'] == target_id]
         local_ests    = [r['est_dp_gap'] for r in local]
         local_aud_ids = [r['auditor_id'] for r in local]
 
-        # Global estimate
-        glob = next(r for r in global_results if r['target_id'] == target_id)
-        true_dp = glob['true_dp_gap_model_val']
+        g_all  = next(r for r in global_all_results  if r['target_id'] == target_id)
+        g_excl = next(r for r in global_excl_results if r['target_id'] == target_id)
+        true_dp = g_all['true_dp_gap_model_val']
 
-        # Plot
         x_local = range(len(local))
-        bars = ax.bar(x_local, local_ests,
-                      color=[NODE_COLORS[i-1] for i in local_aud_ids],
-                      edgecolor='white', linewidth=1.2, label='Local auditors')
+        ax.bar(x_local, local_ests,
+               color=[NODE_COLORS[i-1] for i in local_aud_ids],
+               edgecolor='white', linewidth=1.2, label='Local auditors')
         ax.axhline(true_dp, color='black', linestyle='--',
                    linewidth=1.5, label=f'True DP ({true_dp:.3f})')
-        ax.axhline(glob['est_dp_gap'], color='red', linestyle='-.',
-                   linewidth=1.5, label=f'Global ({glob["est_dp_gap"]:.3f})')
+        ax.axhline(g_all['est_dp_gap'],  color='red',    linestyle='-.',
+                   linewidth=1.5, label=f'Global all ({g_all["est_dp_gap"]:.3f})')
+        ax.axhline(g_excl['est_dp_gap'], color='orange', linestyle=':',
+                   linewidth=1.5, label=f'Global excl ({g_excl["est_dp_gap"]:.3f})')
 
         ax.set_title(f'Target: Node {target_id}', fontweight='bold')
         ax.set_xlabel('Auditor Node')
         ax.set_xticks(list(x_local))
         ax.set_xticklabels([f'N{i}' for i in local_aud_ids])
-        ax.set_ylim(0, max(local_ests + [true_dp, glob['est_dp_gap']]) * 1.3)
+        ax.set_ylim(0, max(local_ests + [true_dp,
+                                         g_all['est_dp_gap'],
+                                         g_excl['est_dp_gap']]) * 1.3)
         ax.legend(fontsize=7)
         ax.spines[['top','right']].set_visible(False)
 
@@ -659,7 +682,8 @@ def plot_global_vs_local(full_results, global_results, plot_dir):
     return out
 
 
-def plot_ranking_accuracy(full_results, budget_results, global_results,
+def plot_ranking_accuracy(full_results, budget_results,
+                          global_all_results, global_excl_results,
                           true_dp_gaps, plot_dir):
     """
     Ranking accuracy: does the auditor correctly rank target nodes
@@ -672,7 +696,7 @@ def plot_ranking_accuracy(full_results, budget_results, global_results,
     target_ids = sorted(true_dp_gaps.keys())
     true_ranks = [true_dp_gaps[t] for t in target_ids]
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     fig.suptitle('Ranking Accuracy — Does the Auditor Correctly Rank Nodes by DP Gap?',
                  fontsize=12, fontweight='bold')
 
@@ -750,28 +774,30 @@ def plot_ranking_accuracy(full_results, budget_results, global_results,
     ax.legend(fontsize=8)
     ax.spines[['top','right']].set_visible(False)
 
-    # ── Panel 3: Global auditor spearman ──────────────────────────────────────
-    ax = axes[2]
-    global_sorted = sorted(global_results, key=lambda r: r['target_id'])
-    glob_est  = [r['est_dp_gap']              for r in global_sorted]
-    glob_true = [true_dp_gaps[r['target_id']] for r in global_sorted]
-    if len(glob_est) > 1:
-        glob_corr, glob_pval = scipy_stats.spearmanr(glob_true, glob_est)
-    else:
-        glob_corr, glob_pval = 0.0, 1.0
+    # ── Panels 3 & 4: Global auditor spearman (all vs excl) ───────────────────
+    def _plot_global_panel(ax, global_results, title_suffix, color):
+        g_sorted  = sorted(global_results, key=lambda r: r['target_id'])
+        g_est     = [r['est_dp_gap']              for r in g_sorted]
+        g_true    = [true_dp_gaps[r['target_id']] for r in g_sorted]
+        if len(g_est) > 1:
+            corr, pval = scipy_stats.spearmanr(g_true, g_est)
+        else:
+            corr, pval = 0.0, 1.0
+        ax.scatter(g_true, g_est, color=color, s=120, zorder=3)
+        lims = [0, max(g_true + g_est) * 1.3]
+        ax.plot(lims, lims, 'k--', alpha=0.4, label='Perfect')
+        for r in g_sorted:
+            ax.annotate(f"Node {r['target_id']}",
+                        xy=(true_dp_gaps[r['target_id']], r['est_dp_gap']),
+                        xytext=(5, 5), textcoords='offset points', fontsize=9)
+        ax.set_xlabel('True DP Gap'); ax.set_ylabel('Estimated DP Gap')
+        ax.set_title(f'Global Auditor ({title_suffix})\nSpearman ρ={corr:.2f}  p={pval:.3f}')
+        ax.set_xlim(lims); ax.set_ylim(lims)
+        ax.legend(fontsize=8)
+        ax.spines[['top','right']].set_visible(False)
 
-    ax.scatter(glob_true, glob_est, color='black', s=120, zorder=3)
-    lims = [0, max(glob_true + glob_est) * 1.3]
-    ax.plot(lims, lims, 'k--', alpha=0.4, label='Perfect')
-    for r in global_sorted:
-        ax.annotate(f"Node {r['target_id']}",
-                    xy=(true_dp_gaps[r['target_id']], r['est_dp_gap']),
-                    xytext=(5, 5), textcoords='offset points', fontsize=9)
-    ax.set_xlabel('True DP Gap'); ax.set_ylabel('Global Estimated DP Gap')
-    ax.set_title(f'Global Auditor\nSpearman ρ={glob_corr:.2f}  p={glob_pval:.3f}')
-    ax.set_xlim(lims); ax.set_ylim(lims)
-    ax.legend(fontsize=8)
-    ax.spines[['top','right']].set_visible(False)
+    _plot_global_panel(axes[2], global_all_results,  'all data',       'black')
+    _plot_global_panel(axes[3], global_excl_results, 'excl own data',  'orange')
 
     plt.tight_layout()
     out = os.path.join(plot_dir, f'step5_ranking_accuracy_{PARTITION_ATTR}.png')
@@ -900,14 +926,16 @@ def main():
              f"({total_time/60:.1f} min)\n")
 
     # ── Flatten results ────────────────────────────────────────────────────────
-    full_results   = []
-    budget_results = []
-    global_results = []
+    full_results        = []
+    budget_results      = []
+    global_all_results  = []
+    global_excl_results = []
 
     for target_id, res in all_target_results.items():
         full_results.extend(res['full'])
         budget_results.extend(res['budget'])
-        global_results.append(res['global'])
+        global_all_results.append(res['global_all'])
+        global_excl_results.append(res['global_excl'])
 
     if not full_results:
         log.info("  ✗ No successful audits — exiting")
@@ -934,12 +962,19 @@ def main():
     log.info(f"\n{'─'*70}")
     log.info("  Global Audit — Summary")
     log.info(f"{'─'*70}\n")
-    for r in sorted(global_results, key=lambda x: x['target_id']):
-        log.info(f"  Global → Node {r['target_id']}  "
-                 f"est_dp={r['est_dp_gap']:.4f}  "
-                 f"true_dp={r['true_dp_gap_model_val']:.4f}  "
-                 f"abs_err={r['abs_error']:.4f}  "
-                 f"rel_err={r['rel_error']:.1%}")
+    log.info(f"  {'Target':<8} {'True DP':>8} {'Est(all)':>10} {'Err(all)':>10} "
+             f"{'Est(excl)':>11} {'Err(excl)':>11}")
+    log.info("  " + "-" * 62)
+    for r_all, r_excl in zip(
+        sorted(global_all_results,  key=lambda x: x['target_id']),
+        sorted(global_excl_results, key=lambda x: x['target_id'])
+    ):
+        log.info(f"  Node {r_all['target_id']:<4}"
+                 f" {r_all['true_dp_gap_model_val']:>8.4f}"
+                 f" {r_all['est_dp_gap']:>10.4f}"
+                 f" {r_all['abs_error']:>10.4f}"
+                 f" {r_excl['est_dp_gap']:>11.4f}"
+                 f" {r_excl['abs_error']:>11.4f}")
 
     # ── Generate plots ─────────────────────────────────────────────────────────
     log.info(f"\n{'─'*70}")
@@ -959,11 +994,12 @@ def main():
         budget_results, node_partition_stats, PLOT_DIR)
     log.info(f"  ✓ {out}")
 
-    out = plot_global_vs_local(full_results, global_results, PLOT_DIR)
+    out = plot_global_vs_local(full_results, global_all_results, global_excl_results, PLOT_DIR)
     log.info(f"  ✓ {out}")
 
     out = plot_ranking_accuracy(
-        full_results, budget_results, global_results, true_dp_gaps, PLOT_DIR)
+        full_results, budget_results,
+        global_all_results, global_excl_results, true_dp_gaps, PLOT_DIR)
     log.info(f"  ✓ {out}")
 
     # ── Save results JSON ──────────────────────────────────────────────────────
@@ -982,7 +1018,8 @@ def main():
         'true_dp_gaps_data'    : true_dp_gaps_data,
         'full_results'         : full_results,
         'budget_results'       : budget_results,
-        'global_results'       : global_results,
+        'global_all_results'   : global_all_results,
+        'global_excl_results'  : global_excl_results,
         'summary': {
             'full_mean_abs_error_model_val' : float(abs_errs.mean()),
             'full_std_abs_error_model_val'  : float(abs_errs.std()),
