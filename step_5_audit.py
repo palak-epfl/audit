@@ -232,11 +232,17 @@ def run_single_audit(model, dataset, query_indices, query_gender,
 
 
 def _add_gt_errors(r, true_dp_data, true_dp_model_full):
-    """Attach data and model-full ground truth errors to an audit result dict."""
+    """Attach data and model-full ground truth errors to an audit result dict.
+    Also adds _model_val aliases so all three GTs use consistent key names."""
     est = r['est_dp_gap']
+    # model_val aliases (primary fields set by run_single_audit)
+    r['abs_error_model_val']    = r['abs_error']
+    r['rel_error_model_val']    = r['rel_error']
+    # data ground truth
     r['true_dp_gap_data']       = true_dp_data
     r['abs_error_data']         = abs(est - true_dp_data)
     r['rel_error_data']         = r['abs_error_data'] / true_dp_data if true_dp_data > 0 else 0.0
+    # model-full ground truth
     r['true_dp_gap_model_full'] = true_dp_model_full
     r['abs_error_model_full']   = abs(est - true_dp_model_full)
     r['rel_error_model_full']   = (r['abs_error_model_full'] / true_dp_model_full
@@ -378,10 +384,11 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
                     'std_est_dp'             : float(np.std(est_dps)),
                     'ci_lower'               : ci_lo,
                     'ci_upper'               : ci_hi,
-                    'mean_abs_error'         : mean_abs,
-                    'mean_rel_error'         : mean_rel,
-                    'mean_abs_error_data'    : mean_abs_data,
-                    'mean_abs_error_model_full': mean_abs_full,
+                    'mean_abs_error'              : mean_abs,
+                    'mean_abs_error_model_val'    : mean_abs,
+                    'mean_rel_error'              : mean_rel,
+                    'mean_abs_error_data'         : mean_abs_data,
+                    'mean_abs_error_model_full'   : mean_abs_full,
                     'repeats'                : repeat_results,
                 }
                 budget_results.append(budget_agg)
@@ -1006,16 +1013,21 @@ def main():
     abs_errs_data = np.array([r['abs_error_data']        for r in full_results])
     abs_errs_full = np.array([r['abs_error_model_full']  for r in full_results])
 
+    # Reconstruct model-full ground truth per node from worker results
+    true_dp_gaps_model_full = {r['target_id']: r['true_dp_gap_model_full']
+                               for r in global_all_results}
+
     results = {
-        'experiment'           : EXP_NAME,
-        'partition_attr'       : PARTITION_ATTR,
-        'alpha'                : ALPHA,
-        'num_nodes'            : NUM_NODES,
-        'budget_sizes'         : BUDGET_SIZES,
-        'num_repeats'          : NUM_REPEATS,
-        'total_time_s'         : total_time,
+        'experiment'              : EXP_NAME,
+        'partition_attr'          : PARTITION_ATTR,
+        'alpha'                   : ALPHA,
+        'num_nodes'               : NUM_NODES,
+        'budget_sizes'            : BUDGET_SIZES,
+        'num_repeats'             : NUM_REPEATS,
+        'total_time_s'            : total_time,
         'true_dp_gaps_model_val'  : true_dp_gaps,
-        'true_dp_gaps_data'    : true_dp_gaps_data,
+        'true_dp_gaps_data'       : true_dp_gaps_data,
+        'true_dp_gaps_model_full' : true_dp_gaps_model_full,
         'full_results'         : full_results,
         'budget_results'       : budget_results,
         'global_all_results'   : global_all_results,
