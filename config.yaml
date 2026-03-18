@@ -1,5 +1,5 @@
 experiment:
-    name: "lenet_alpha0.5_5nodes_seed42"
+    name: null       # auto-generated as "lenet_alpha{alpha}_{num_nodes}nodes_seed{seed}"
     notes: "Single LeNet baseline, full CelebA, gender sensitive attr"
     run_date: null   # set to "YYYY-MM-DD" to pin a date; null = today's date at runtime
 
@@ -59,10 +59,11 @@ training:
 # ── Partitioning ──────────────────────────────────────────────
 partition:
     num_nodes: 5
-    alpha: 0.5
+    alpha: 0.5                      # used by steps 4/5 (single value)
+    alpha_values: [0.5, 0.1]  # swept by step 3
     min_samples: 10000
     seed: 42
-    partition_attr: "High_Cheekbones" 
+    partition_attr: "High_Cheekbones"
 
 # ── Auditing ──────────────────────────────────────────────────
 audit:
