@@ -1,0 +1,2018 @@
+"""
+Step 5 Extra Plots
+===================
+Reads from already-generated step5_audit_results.json and produces
+additional visualisations. No re-running of audits needed.
+
+Run with:
+    python step5_extra_plots.py
+    python3 step_5_audit_extra_plots.py --config config.yaml
+
+Produces:
+    plots/step5b_budget_labelled.png           (1) fixed budget labels
+    plots/step5b_per_auditee_budget.png        (2) per-auditee budget curves
+    plots/step5b_confidence_intervals.png      (3) CI plot per pair per budget
+    plots/step5b_bias_variance.png             (4) bias vs variance decomposition
+    plots/step5b_combined_all_modes.png        (5) global + local + budgeted together
+    plots/step5b_auditor_consistency.png       (6) per-auditor consistency box plots
+"""
+
+import os
+import sys
+import json
+import argparse
+import logging
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+from scipy import stats as scipy_stats
+import yaml
+
+# ── Argument parsing ───────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description='Step 5 Extra Plots')
+parser.add_argument('--config', type=str, default='config.yaml')
+args = parser.parse_args()
+
+with open(args.config) as f:
+    cfg = yaml.safe_load(f)
+
+EXP_NAME  = cfg['experiment']['name']
+NUM_NODES = cfg['partition']['num_nodes']
+NFS_ROOT  = os.environ.get('NFS_ROOT', cfg['nfs']['root'])
+EXP_DIR   = os.path.join(NFS_ROOT, 'experiments', EXP_NAME)
+PLOT_DIR  = os.path.join(EXP_DIR, 'plots')
+LOG_DIR   = os.path.join(EXP_DIR, 'logs')
+
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log_path = os.path.join(LOG_DIR, 'step5b.log')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_path, mode='w')
+    ]
+)
+log = logging.getLogger()
+
+# ── Style constants ────────────────────────────────────────────────────────────
+NODE_COLORS   = ['steelblue', 'salmon', 'mediumseagreen', 'mediumpurple', 'sandybrown']
+LINE_STYLES   = ['-', '--', '-.', ':', (0,(3,1,1,1))]   # one per target node
+MARKER_STYLES = ['o', 's', '^', 'D', 'v']
+
+# ── Load results ───────────────────────────────────────────────────────────────
+log.info("=" * 70)
+log.info("  Step 5b: Extra Plots")
+log.info("=" * 70)
+
+results_path = os.path.join(EXP_DIR, 'results', 'step5_audit_results.json')
+log.info(f"\n  Loading results from {results_path}...")
+with open(results_path) as f:
+    data = json.load(f)
+
+full_results   = data['full_results']
+budget_results = data['budget_results']
+global_results = data['global_results']
+budget_sizes   = sorted(set(r['budget'] for r in budget_results))
+auditor_ids    = sorted(set(r['auditor_id'] for r in full_results))
+
+# All three ground truth definitions
+GT_VARIANTS = {
+    'data'       : ('Data Labels (full local)',      'data'),
+    'model_val'  : ('Model Predictions (val only)',  'model_val'),
+    'model_full' : ('Model Predictions (full local)', 'model_full'),
+}
+all_true_dp_gaps = {
+    'data'       : {int(k): v for k, v in data['true_dp_gaps_data'].items()},
+    'model_val'  : {int(k): v for k, v in data['true_dp_gaps_model_val'].items()},
+    'model_full' : {int(k): v for k, v in data['true_dp_gaps_model_full'].items()},
+}
+# Primary (model_val) — used for backward compat in helpers that need true_dp_gaps
+true_dp_gaps = all_true_dp_gaps['model_val']
+target_ids   = sorted(true_dp_gaps.keys())
+
+log.info(f"  ✓ Loaded")
+log.info(f"    Full results   : {len(full_results)}")
+log.info(f"    Budget results : {len(budget_results)}")
+log.info(f"    Global results : {len(global_results)}")
+log.info(f"    Budget sizes   : {budget_sizes}")
+log.info(f"    Nodes          : {NUM_NODES}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: get budget-aggregated result for a specific (auditor, target, budget)
+# ─────────────────────────────────────────────────────────────────────────────
+def get_budget_agg(auditor_id, target_id, budget):
+    matches = [r for r in budget_results
+               if r['auditor_id'] == auditor_id
+               and r['target_id'] == target_id
+               and r['budget'] == budget]
+    return matches[0] if matches else None
+
+
+def get_full(auditor_id, target_id):
+    matches = [r for r in full_results
+               if r['auditor_id'] == auditor_id
+               and r['target_id'] == target_id]
+    return matches[0] if matches else None
+
+
+def get_global(target_id):
+    matches = [r for r in global_results if r['target_id'] == target_id]
+    return matches[0] if matches else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate all plots for each ground truth definition
+# ─────────────────────────────────────────────────────────────────────────────
+for gt_name, gt_label in [
+    ('data',       'GT: Data Labels'),
+    ('model_val',  'GT: Model Val'),
+    ('model_full', 'GT: Model Full'),
+]:
+    log.info(f"\n{'='*70}")
+    log.info(f"  Ground Truth: {gt_label}")
+    log.info(f"{'='*70}\n")
+
+    # Re-alias error fields in all results to point to current GT
+    # so all plot code can use r['abs_error'] / r['mean_abs_error'] unchanged
+    true_dp_gaps = all_true_dp_gaps[gt_name]
+    for r in full_results:
+        r['abs_error']   = r[f'abs_error_{gt_name}']
+        r['rel_error']   = r[f'rel_error_{gt_name}']
+        r['true_dp_gap'] = r[f'true_dp_{gt_name}']
+    for r in budget_results:
+        r['mean_abs_error'] = r[f'mean_abs_error_{gt_name}']
+        r['mean_rel_error'] = r[f'mean_rel_error_{gt_name}']
+        r['true_dp_gap']    = r[f'true_dp_{gt_name}']
+        for rep in r['repeats']:
+            rep['abs_error'] = rep[f'abs_error_{gt_name}']
+            rep['rel_error'] = rep[f'rel_error_{gt_name}']
+    for r in global_results:
+        r['abs_error']   = r[f'abs_error_{gt_name}']
+        r['rel_error']   = r[f'rel_error_{gt_name}']
+        r['true_dp_gap'] = r[f'true_dp_{gt_name}']
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 1: Budget curves with proper N1→N3 labels
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 1: Budget curves with N_aud→N_tgt labels...")
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle('Budgeted Audit — Sample Efficiency\n'
+                 'Label format: Nauditor→Ntarget',
+                 fontsize=13, fontweight='bold')
+
+    # Left panel: abs error vs budget, one line per pair
+    ax = axes[0]
+    for aud_id in auditor_ids:
+        for tgt_id in target_ids:
+            if aud_id == tgt_id:
+                continue
+            pair_data = sorted(
+                [r for r in budget_results
+                 if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+                key=lambda r: r['budget']
+            )
+            if not pair_data:
+                continue
+            budgets   = [r['budget']         for r in pair_data]
+            mean_errs = [r['mean_abs_error'] for r in pair_data]
+            # std of abs errors across repeats — matches the y-axis (mean abs error)
+            std_errs  = [
+                float(np.std([rep['abs_error'] for rep in r['repeats']]))
+                for r in pair_data
+            ]
+
+            color     = NODE_COLORS[aud_id - 1]
+            linestyle = LINE_STYLES[(tgt_id - 1) % len(LINE_STYLES)]
+            label     = f'N{aud_id}→N{tgt_id}'
+
+            ax.plot(budgets, mean_errs, color=color, linestyle=linestyle,
+                    linewidth=1.5, marker=MARKER_STYLES[tgt_id-1],
+                    markersize=4, label=label)
+
+    ax.set_xlabel('Query Budget')
+    ax.set_ylabel('Mean Absolute Error')
+    ax.set_title('All Pairs (colour=auditor, style=target)')
+    ax.set_xscale('log')
+    ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left',
+              fontsize=7, ncol=1)
+    ax.spines[['top','right']].set_visible(False)
+
+    # Right panel: averaged across all pairs with std shading
+    ax = axes[1]
+    mean_per_budget = []
+    std_per_budget  = []
+    for budget in budget_sizes:
+        # Collect all per-repeat abs errors across all pairs at this budget,
+        # then take std — this is the uncertainty on the mean abs error curve
+        all_abs_errs = [
+            rep['abs_error']
+            for r in budget_results if r['budget'] == budget
+            for rep in r['repeats']
+        ]
+        mean_per_budget.append(np.mean([r['mean_abs_error'] for r in budget_results
+                                        if r['budget'] == budget]))
+        std_per_budget.append(np.std(all_abs_errs))
+
+    m = np.array(mean_per_budget)
+    s = np.array(std_per_budget)
+    ax.plot(budget_sizes, m, color='steelblue', linewidth=2,
+            marker='o', label='Mean ± std across all pairs')
+    ax.fill_between(budget_sizes, m - s, m + s,
+                    alpha=0.2, color='steelblue')
+
+    # Mark each budget size
+    for b, mv in zip(budget_sizes, m):
+        ax.annotate(f'{b}', xy=(b, mv), xytext=(0, 8),
+                    textcoords='offset points', ha='center',
+                    fontsize=8, color='steelblue')
+
+    ax.set_xlabel('Query Budget')
+    ax.set_ylabel('Mean Absolute Error')
+    ax.set_title('Averaged Across All Pairs\n(shading = ±1 std)')
+    ax.set_xscale('log')
+    ax.legend(fontsize=9)
+    ax.spines[['top','right']].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_budget_labelled_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 2: Per-auditee budget curves
+    # One subplot per target node. Each line = one auditor.
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 2: Per-auditee budget curves...")
+
+    ncols = min(3, len(target_ids))
+    nrows = (len(target_ids) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(5 * ncols, 4 * nrows),
+                              squeeze=False)
+    fig.suptitle('Per-Auditee Budget Curves\n'
+                 'How does each auditor\'s accuracy improve with more queries?',
+                 fontsize=13, fontweight='bold')
+
+    for idx, tgt_id in enumerate(target_ids):
+        ax       = axes[idx // ncols][idx % ncols]
+        true_dp  = true_dp_gaps[tgt_id]
+
+        for aud_id in auditor_ids:
+            if aud_id == tgt_id:
+                continue
+            pair_data = sorted(
+                [r for r in budget_results
+                 if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+                key=lambda r: r['budget']
+            )
+            if not pair_data:
+                continue
+            budgets   = [r['budget']         for r in pair_data]
+            mean_errs = [r['mean_abs_error'] for r in pair_data]
+            # std of absolute errors across repeats — correct uncertainty for
+            # a mean abs error plot. std_est_dp would be wrong here because
+            # it measures spread of raw DP estimates, not spread of abs errors.
+            std_abs_errs = [
+                float(np.std([rep['abs_error'] for rep in r['repeats']]))
+                for r in pair_data
+            ]
+
+            color = NODE_COLORS[aud_id - 1]
+            ax.plot(budgets, mean_errs, color=color, linewidth=1.8,
+                    marker='o', markersize=4, label=f'Auditor N{aud_id}')
+            ax.fill_between(budgets,
+                            np.maximum(np.array(mean_errs) - np.array(std_abs_errs), 0),
+                            np.array(mean_errs) + np.array(std_abs_errs),
+                            alpha=0.1, color=color)
+
+        # Full local reference lines — one dashed line per auditor
+        # coloured to match its budgeted curve, labelled at right edge
+        for aud_id in auditor_ids:
+            if aud_id == tgt_id:
+                continue
+            full = get_full(aud_id, tgt_id)
+            if full:
+                ax.axhline(full['abs_error'], color=NODE_COLORS[aud_id-1],
+                           linestyle='--', alpha=0.5, linewidth=1)
+                # Label at right edge so it is clear which auditor it belongs to
+                ax.text(budget_sizes[-1] * 1.05, full['abs_error'],
+                        f'N{aud_id} full', fontsize=6,
+                        color=NODE_COLORS[aud_id-1], va='center', alpha=0.7)
+
+        # Global auditor reference line — single red dash-dot, same for all auditors
+        glob = get_global(tgt_id)
+        if glob:
+            ax.axhline(glob['abs_error'], color='red',
+                       linestyle='-.', linewidth=1.5,
+                       label=f'Global (err={glob["abs_error"]:.3f})')
+            ax.text(budget_sizes[-1] * 1.05, glob['abs_error'],
+                    'global', fontsize=6, color='red', va='center')
+
+        ax.set_title(f'Target: Node {tgt_id}  (true DP={true_dp:.3f})',
+                     fontweight='bold')
+        ax.set_xlabel('Query Budget')
+        ax.set_ylabel('Mean Absolute Error')
+        ax.set_xscale('log')
+        ax.legend(fontsize=7)
+        ax.spines[['top','right']].set_visible(False)
+
+        # Legend note
+        ax.text(0.98, 0.98,
+                'Dashed = full local per auditor\nDash-dot = global auditor',
+                transform=ax.transAxes, fontsize=6,
+                ha='right', va='top', color='gray')
+
+    # Hide unused subplots
+    for idx in range(len(target_ids), nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_per_auditee_budget_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 3: Confidence intervals per (auditor, target) pair per budget
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 3: Confidence interval plot...")
+
+    n_budgets = len(budget_sizes)
+    ncols     = min(3, n_budgets)
+    nrows     = (n_budgets + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(6 * ncols, 4 * nrows),
+                              squeeze=False)
+    fig.suptitle('Bootstrap 95% Confidence Intervals on Estimated DP Gap\n'
+                 'per Auditor→Target Pair at Each Budget',
+                 fontsize=13, fontweight='bold')
+
+    for idx, budget in enumerate(budget_sizes):
+        ax      = axes[idx // ncols][idx % ncols]
+        pairs   = [(aud, tgt)
+                   for aud in auditor_ids for tgt in target_ids
+                   if aud != tgt]
+        x_ticks = []
+        x_labels= []
+
+        for x_pos, (aud_id, tgt_id) in enumerate(pairs):
+            r = get_budget_agg(aud_id, tgt_id, budget)
+            if r is None:
+                continue
+
+            mean_dp = r['mean_est_dp']
+            ci_lo   = r['ci_lower']
+            ci_hi   = r['ci_upper']
+            true_dp = true_dp_gaps[tgt_id]
+            color   = NODE_COLORS[aud_id - 1]
+
+            # CI bar
+            ax.plot([x_pos, x_pos], [ci_lo, ci_hi],
+                    color=color, linewidth=2, solid_capstyle='round')
+            # Mean point
+            ax.scatter(x_pos, mean_dp, color=color, s=40, zorder=4)
+            # True DP tick
+            ax.scatter(x_pos, true_dp, color='black',
+                       marker='_', s=80, zorder=5, linewidths=2)
+
+            x_ticks.append(x_pos)
+            x_labels.append(f'N{aud_id}→N{tgt_id}')
+
+        ax.set_title(f'Budget = {budget}', fontweight='bold')
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=7)
+        ax.set_ylabel('Estimated DP Gap')
+        ax.spines[['top','right']].set_visible(False)
+
+        # Legend
+        ci_line   = mlines.Line2D([], [], color='gray', linewidth=2,
+                                   label='95% CI')
+        true_mark = mlines.Line2D([], [], color='black', marker='_',
+                                   markersize=8, linewidth=0,
+                                   label='True DP gap')
+        ax.legend(handles=[ci_line, true_mark], fontsize=7)
+
+    # Hide unused
+    for idx in range(n_budgets, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_confidence_intervals_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 4: Bias vs variance decomposition
+    # bias  = mean(estimated DP) - true DP     (systematic over/underestimation)
+    # variance = std(estimated DP)²            (sensitivity to query sample)
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 4: Bias vs variance decomposition...")
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle('Bias vs Variance Decomposition of Audit Error\n'
+                 'bias = mean(est DP) − true DP  |  '
+                 'variance = std(est DP)²  |  '
+                 'MSE = bias² + variance',
+                 fontsize=12, fontweight='bold')
+
+    # Collect bias and variance per pair per budget
+    bv_data = {}   # (aud, tgt, budget) → {bias, variance, mse}
+    for r in budget_results:
+        aud_id  = r['auditor_id']
+        tgt_id  = r['target_id']
+        budget  = r['budget']
+        true_dp = true_dp_gaps[tgt_id]
+
+        # Extract per-repeat estimates
+        repeat_ests = [rep['est_dp_gap'] for rep in r['repeats']]
+        mean_est    = np.mean(repeat_ests)
+        std_est     = np.std(repeat_ests)
+
+        bias     = float(mean_est - true_dp)   # signed: positive = overestimate
+        variance = float(std_est ** 2)
+        mse      = float(bias ** 2 + variance)
+
+        bv_data[(aud_id, tgt_id, budget)] = {
+            'bias': bias, 'variance': variance, 'mse': mse,
+            'abs_bias': abs(bias)
+        }
+
+    # Panel 1: |bias| vs budget, averaged across pairs
+    ax = axes[0]
+    mean_bias_per_budget = []
+    std_bias_per_budget  = []
+    for budget in budget_sizes:
+        abs_biases = [bv_data[(a, t, budget)]['abs_bias']
+                      for a in auditor_ids for t in target_ids
+                      if a != t and (a, t, budget) in bv_data]
+        mean_bias_per_budget.append(np.mean(abs_biases))
+        std_bias_per_budget.append(np.std(abs_biases))
+
+    m = np.array(mean_bias_per_budget)
+    s = np.array(std_bias_per_budget)
+    ax.plot(budget_sizes, m, color='tomato', linewidth=2,
+            marker='o', label='Mean |bias|')
+    ax.fill_between(budget_sizes, m - s, m + s, alpha=0.2, color='tomato')
+    ax.set_xlabel('Query Budget'); ax.set_ylabel('|Bias|')
+    ax.set_title('|Bias| vs Budget\n(does more data reduce systematic error?)')
+    ax.set_xscale('log')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # Panel 2: variance vs budget, averaged across pairs
+    ax = axes[1]
+    mean_var_per_budget = []
+    std_var_per_budget  = []
+    for budget in budget_sizes:
+        variances = [bv_data[(a, t, budget)]['variance']
+                     for a in auditor_ids for t in target_ids
+                     if a != t and (a, t, budget) in bv_data]
+        mean_var_per_budget.append(np.mean(variances))
+        std_var_per_budget.append(np.std(variances))
+
+    m = np.array(mean_var_per_budget)
+    s = np.array(std_var_per_budget)
+    ax.plot(budget_sizes, m, color='steelblue', linewidth=2,
+            marker='o', label='Mean variance')
+    ax.fill_between(budget_sizes, np.maximum(m - s, 0), m + s,
+                    alpha=0.2, color='steelblue')
+    ax.set_xlabel('Query Budget'); ax.set_ylabel('Variance')
+    ax.set_title('Variance vs Budget\n(does more data reduce noise?)')
+    ax.set_xscale('log')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # Panel 3: stacked bias² + variance = MSE at each budget
+    ax = axes[2]
+    mean_bias2 = [np.mean([bv_data[(a,t,b)]['bias']**2
+                            for a in auditor_ids for t in target_ids
+                            if a != t and (a,t,b) in bv_data])
+                  for b in budget_sizes]
+    mean_var   = [np.mean([bv_data[(a,t,b)]['variance']
+                            for a in auditor_ids for t in target_ids
+                            if a != t and (a,t,b) in bv_data])
+                  for b in budget_sizes]
+
+    x = np.arange(len(budget_sizes))
+    w = 0.5
+    ax.bar(x, mean_bias2, w, label='Bias²',     color='tomato',    alpha=0.85)
+    ax.bar(x, mean_var,   w, bottom=mean_bias2, label='Variance',
+           color='steelblue', alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(b) for b in budget_sizes])
+    ax.set_xlabel('Query Budget'); ax.set_ylabel('MSE')
+    ax.set_title('MSE = Bias² + Variance\n(what drives the error at each budget?)')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_bias_variance_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 5: Global + full local + budgeted on one axis per target node
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 5: Combined all modes per target...")
+
+    ncols = min(3, len(target_ids))
+    nrows = (len(target_ids) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(6 * ncols, 5 * nrows),
+                              squeeze=False)
+    fig.suptitle('All Audit Modes Combined per Target Node\n'
+                 'Global  |  Full Local  |  Budgeted (with CI)',
+                 fontsize=13, fontweight='bold')
+
+    for idx, tgt_id in enumerate(target_ids):
+        ax      = axes[idx // ncols][idx % ncols]
+        true_dp = true_dp_gaps[tgt_id]
+
+        # True DP reference line
+        ax.axhline(true_dp, color='black', linestyle='--',
+                   linewidth=1.5, label=f'True DP ({true_dp:.3f})', zorder=1)
+
+        # Global estimate — horizontal band
+        glob = get_global(tgt_id)
+        if glob:
+            ax.axhline(glob['est_dp_gap'], color='red', linestyle='-.',
+                       linewidth=1.5,
+                       label=f'Global ({glob["est_dp_gap"]:.3f})', zorder=2)
+
+        # For each auditor: full local + budgeted curve
+        for aud_id in auditor_ids:
+            if aud_id == tgt_id:
+                continue
+            color = NODE_COLORS[aud_id - 1]
+
+            # Full local — single point at x = max_budget * 1.3 (right side)
+            full = get_full(aud_id, tgt_id)
+
+            # Budgeted curve
+            pair_budget = sorted(
+                [r for r in budget_results
+                 if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+                key=lambda r: r['budget']
+            )
+            if pair_budget:
+                budgets   = [r['budget']     for r in pair_budget]
+                mean_ests = [r['mean_est_dp'] for r in pair_budget]
+                ci_los    = [r['ci_lower']    for r in pair_budget]
+                ci_his    = [r['ci_upper']    for r in pair_budget]
+
+                ax.plot(budgets, mean_ests, color=color, linewidth=1.8,
+                        marker='o', markersize=4,
+                        label=f'N{aud_id} budgeted', zorder=3)
+                ax.fill_between(budgets, ci_los, ci_his,
+                                alpha=0.15, color=color)
+
+            # Full local — plotted as a star at x just beyond max budget
+            if full:
+                x_full = budget_sizes[-1] * 1.5
+                ax.scatter(x_full, full['est_dp_gap'],
+                           color=color, marker='*', s=180, zorder=5)
+
+        # Add a text label for the star markers
+        ax.text(0.97, 0.04, '★ = full local',
+                transform=ax.transAxes, fontsize=7,
+                ha='right', va='bottom', color='gray')
+
+        ax.set_title(f'Target: Node {tgt_id}', fontweight='bold')
+        ax.set_xlabel('Query Budget (★ = full local data)')
+        ax.set_ylabel('Estimated DP Gap')
+        ax.set_xscale('log')
+        ax.legend(fontsize=7, loc='upper right')
+        ax.spines[['top','right']].set_visible(False)
+
+    # Hide unused subplots
+    for idx in range(len(target_ids), nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_combined_all_modes_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 6: Per-auditor consistency box plots
+    # For each auditor: distribution of absolute errors across all targets
+    # and all budget sizes. Shows which auditor is most/least consistent.
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 6: Per-auditor consistency box plots...")
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('Per-Auditor Consistency\n'
+                 'How much does error vary across different targets?',
+                 fontsize=13, fontweight='bold')
+
+    # Panel 1: full local — box per auditor, one point per target
+    ax = axes[0]
+    full_errors_per_auditor = []
+    labels = []
+    for aud_id in auditor_ids:
+        errs = [r['abs_error'] for r in full_results
+                if r['auditor_id'] == aud_id]
+        full_errors_per_auditor.append(errs)
+        labels.append(f'Node {aud_id}\n(n={len(errs)})')
+
+    bp = ax.boxplot(full_errors_per_auditor, patch_artist=True,
+                    medianprops=dict(color='black', linewidth=2))
+    for patch, color in zip(bp['boxes'], NODE_COLORS):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    # Overlay individual points
+    for x_pos, (errs, aud_id) in enumerate(
+            zip(full_errors_per_auditor, auditor_ids), start=1):
+        jitter = np.random.default_rng(42).uniform(-0.1, 0.1, len(errs))
+        ax.scatter(x_pos + jitter, errs,
+                   color=NODE_COLORS[aud_id-1], alpha=0.6, s=40, zorder=3)
+
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel('Absolute Error')
+    ax.set_title('Full Local Audit\nError distribution across targets per auditor')
+    ax.spines[['top','right']].set_visible(False)
+
+    # Panel 2: budgeted — box per auditor at each budget,
+    # grouped by auditor with budget as hue via offset x positions
+    ax = axes[1]
+    n_auditors = len(auditor_ids)
+    n_budgets  = len(budget_sizes)
+    group_width = 0.8
+    bar_width   = group_width / n_budgets
+    budget_colors = plt.cm.Blues(np.linspace(0.3, 0.9, n_budgets))
+
+    for b_idx, budget in enumerate(budget_sizes):
+        for a_idx, aud_id in enumerate(auditor_ids):
+            errs = [r['mean_abs_error'] for r in budget_results
+                    if r['auditor_id'] == aud_id and r['budget'] == budget]
+            if not errs:
+                continue
+            x = a_idx + (b_idx - n_budgets/2 + 0.5) * bar_width
+            ax.bar(x, np.mean(errs), bar_width * 0.9,
+                   color=budget_colors[b_idx], edgecolor='white',
+                   linewidth=0.5,
+                   label=f'Budget {budget}' if a_idx == 0 else '')
+
+    ax.set_xticks(range(n_auditors))
+    ax.set_xticklabels([f'Node {i}' for i in auditor_ids], fontsize=9)
+    ax.set_ylabel('Mean Absolute Error')
+    ax.set_title('Budgeted Audit\nMean error per auditor at each budget\n'
+                 '(darker = larger budget)')
+    ax.legend(fontsize=7, bbox_to_anchor=(1.01, 1), loc='upper left')
+    ax.spines[['top','right']].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_auditor_consistency_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────────────────────
+log.info(f"\n{'='*70}")
+log.info("  Step 5b Complete")
+log.info(f"{'='*70}")
+log.info(f"\n  All plots saved to: {PLOT_DIR}")
+log.info(f"  Each plot generated 3x — one per ground truth definition:")
+for gt_name, gt_label in [('data','Data Labels'), ('model_val','Model Val'), ('model_full','Model Full')]:
+    log.info(f"\n  [{gt_label}]")
+    for name in ['budget_labelled', 'per_auditee_budget', 'confidence_intervals',
+                 'bias_variance', 'combined_all_modes', 'auditor_consistency']:
+        log.info(f"    step5b_{name}_{gt_name}.png")
+log.info(f"\n  logs/step5b.log")
+log.info(f"{'='*70}")
+
+
+
+
+
+
+# """
+# Step 5 Extra Plots
+# ===================
+# Reads from already-generated step5_audit_results.json and produces
+# additional visualisations. No re-running of audits needed.
+
+# Run with:
+#     python step5_extra_plots.py
+#     python3 step_5_audit_extra_plots.py --config config.yaml
+
+# Produces:
+#     plots/step5b_budget_labelled.png           (1) fixed budget labels
+#     plots/step5b_per_auditee_budget.png        (2) per-auditee budget curves
+#     plots/step5b_confidence_intervals.png      (3) CI plot per pair per budget
+#     plots/step5b_bias_variance.png             (4) bias vs variance decomposition
+#     plots/step5b_combined_all_modes.png        (5) global + local + budgeted together
+#     plots/step5b_auditor_consistency.png       (6) per-auditor consistency box plots
+# """
+
+# import os
+# import sys
+# import json
+# import argparse
+# import logging
+# import numpy as np
+# import matplotlib
+# matplotlib.use('Agg')
+# import matplotlib.pyplot as plt
+# import matplotlib.lines as mlines
+# from scipy import stats as scipy_stats
+# import yaml
+
+# # ── Argument parsing ───────────────────────────────────────────────────────────
+# parser = argparse.ArgumentParser(description='Step 5 Extra Plots')
+# parser.add_argument('--config', type=str, default='config.yaml')
+# args = parser.parse_args()
+
+# with open(args.config) as f:
+#     cfg = yaml.safe_load(f)
+
+# EXP_NAME  = cfg['experiment']['name']
+# NUM_NODES = cfg['partition']['num_nodes']
+# NFS_ROOT  = os.environ.get('NFS_ROOT', cfg['nfs']['root'])
+# EXP_DIR   = os.path.join(NFS_ROOT, 'experiments', EXP_NAME)
+# PLOT_DIR  = os.path.join(EXP_DIR, 'plots')
+# LOG_DIR   = os.path.join(EXP_DIR, 'logs')
+
+# os.makedirs(PLOT_DIR, exist_ok=True)
+
+# # ── Logging ────────────────────────────────────────────────────────────────────
+# log_path = os.path.join(LOG_DIR, 'step5b.log')
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(message)s',
+#     handlers=[
+#         logging.StreamHandler(sys.stdout),
+#         logging.FileHandler(log_path, mode='w')
+#     ]
+# )
+# log = logging.getLogger()
+
+# # ── Style constants ────────────────────────────────────────────────────────────
+# NODE_COLORS   = ['steelblue', 'salmon', 'mediumseagreen', 'mediumpurple', 'sandybrown']
+# LINE_STYLES   = ['-', '--', '-.', ':', (0,(3,1,1,1))]   # one per target node
+# MARKER_STYLES = ['o', 's', '^', 'D', 'v']
+
+# # ── Load results ───────────────────────────────────────────────────────────────
+# log.info("=" * 70)
+# log.info("  Step 5b: Extra Plots")
+# log.info("=" * 70)
+
+# results_path = os.path.join(EXP_DIR, 'results', 'step5_audit_results.json')
+# log.info(f"\n  Loading results from {results_path}...")
+# with open(results_path) as f:
+#     data = json.load(f)
+
+# full_results   = data['full_results']
+# budget_results = data['budget_results']
+# global_results = data['global_results']
+# true_dp_gaps   = {int(k): v for k, v in data['true_dp_gaps'].items()}
+# budget_sizes   = sorted(set(r['budget'] for r in budget_results))
+# auditor_ids    = sorted(set(r['auditor_id'] for r in full_results))
+# target_ids     = sorted(true_dp_gaps.keys())
+
+# log.info(f"  ✓ Loaded")
+# log.info(f"    Full results   : {len(full_results)}")
+# log.info(f"    Budget results : {len(budget_results)}")
+# log.info(f"    Global results : {len(global_results)}")
+# log.info(f"    Budget sizes   : {budget_sizes}")
+# log.info(f"    Nodes          : {NUM_NODES}\n")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Helper: get budget-aggregated result for a specific (auditor, target, budget)
+# # ─────────────────────────────────────────────────────────────────────────────
+# def get_budget_agg(auditor_id, target_id, budget):
+#     matches = [r for r in budget_results
+#                if r['auditor_id'] == auditor_id
+#                and r['target_id'] == target_id
+#                and r['budget'] == budget]
+#     return matches[0] if matches else None
+
+
+# def get_full(auditor_id, target_id):
+#     matches = [r for r in full_results
+#                if r['auditor_id'] == auditor_id
+#                and r['target_id'] == target_id]
+#     return matches[0] if matches else None
+
+
+# def get_global(target_id):
+#     matches = [r for r in global_results if r['target_id'] == target_id]
+#     return matches[0] if matches else None
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Plot 1: Budget curves with proper N1→N3 labels
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info("  Generating Plot 1: Budget curves with N_aud→N_tgt labels...")
+
+# fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+# fig.suptitle('Budgeted Audit — Sample Efficiency\n'
+#              'Label format: Nauditor→Ntarget',
+#              fontsize=13, fontweight='bold')
+
+# # Left panel: abs error vs budget, one line per pair
+# ax = axes[0]
+# for aud_id in auditor_ids:
+#     for tgt_id in target_ids:
+#         if aud_id == tgt_id:
+#             continue
+#         pair_data = sorted(
+#             [r for r in budget_results
+#              if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+#             key=lambda r: r['budget']
+#         )
+#         if not pair_data:
+#             continue
+#         budgets   = [r['budget']         for r in pair_data]
+#         mean_errs = [r['mean_abs_error'] for r in pair_data]
+#         # std of abs errors across repeats — matches the y-axis (mean abs error)
+#         std_errs  = [
+#             float(np.std([rep['abs_error'] for rep in r['repeats']]))
+#             for r in pair_data
+#         ]
+
+#         color     = NODE_COLORS[aud_id - 1]
+#         linestyle = LINE_STYLES[(tgt_id - 1) % len(LINE_STYLES)]
+#         label     = f'N{aud_id}→N{tgt_id}'
+
+#         ax.plot(budgets, mean_errs, color=color, linestyle=linestyle,
+#                 linewidth=1.5, marker=MARKER_STYLES[tgt_id-1],
+#                 markersize=4, label=label)
+
+# ax.set_xlabel('Query Budget')
+# ax.set_ylabel('Mean Absolute Error')
+# ax.set_title('All Pairs (colour=auditor, style=target)')
+# ax.set_xscale('log')
+# ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left',
+#           fontsize=7, ncol=1)
+# ax.spines[['top','right']].set_visible(False)
+
+# # Right panel: averaged across all pairs with std shading
+# ax = axes[1]
+# mean_per_budget = []
+# std_per_budget  = []
+# for budget in budget_sizes:
+#     # Collect all per-repeat abs errors across all pairs at this budget,
+#     # then take std — this is the uncertainty on the mean abs error curve
+#     all_abs_errs = [
+#         rep['abs_error']
+#         for r in budget_results if r['budget'] == budget
+#         for rep in r['repeats']
+#     ]
+#     mean_per_budget.append(np.mean([r['mean_abs_error'] for r in budget_results
+#                                     if r['budget'] == budget]))
+#     std_per_budget.append(np.std(all_abs_errs))
+
+# m = np.array(mean_per_budget)
+# s = np.array(std_per_budget)
+# ax.plot(budget_sizes, m, color='steelblue', linewidth=2,
+#         marker='o', label='Mean ± std across all pairs')
+# ax.fill_between(budget_sizes, m - s, m + s,
+#                 alpha=0.2, color='steelblue')
+
+# # Mark each budget size
+# for b, mv in zip(budget_sizes, m):
+#     ax.annotate(f'{b}', xy=(b, mv), xytext=(0, 8),
+#                 textcoords='offset points', ha='center',
+#                 fontsize=8, color='steelblue')
+
+# ax.set_xlabel('Query Budget')
+# ax.set_ylabel('Mean Absolute Error')
+# ax.set_title('Averaged Across All Pairs\n(shading = ±1 std)')
+# ax.set_xscale('log')
+# ax.legend(fontsize=9)
+# ax.spines[['top','right']].set_visible(False)
+
+# plt.tight_layout()
+# out = os.path.join(PLOT_DIR, 'step5b_budget_labelled.png')
+# plt.savefig(out, dpi=150, bbox_inches='tight')
+# plt.close()
+# log.info(f"  ✓ Saved → {out}")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Plot 2: Per-auditee budget curves
+# # One subplot per target node. Each line = one auditor.
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info("  Generating Plot 2: Per-auditee budget curves...")
+
+# ncols = min(3, len(target_ids))
+# nrows = (len(target_ids) + ncols - 1) // ncols
+# fig, axes = plt.subplots(nrows, ncols,
+#                           figsize=(5 * ncols, 4 * nrows),
+#                           squeeze=False)
+# fig.suptitle('Per-Auditee Budget Curves\n'
+#              'How does each auditor\'s accuracy improve with more queries?',
+#              fontsize=13, fontweight='bold')
+
+# for idx, tgt_id in enumerate(target_ids):
+#     ax       = axes[idx // ncols][idx % ncols]
+#     true_dp  = true_dp_gaps[tgt_id]
+
+#     for aud_id in auditor_ids:
+#         if aud_id == tgt_id:
+#             continue
+#         pair_data = sorted(
+#             [r for r in budget_results
+#              if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+#             key=lambda r: r['budget']
+#         )
+#         if not pair_data:
+#             continue
+#         budgets   = [r['budget']         for r in pair_data]
+#         mean_errs = [r['mean_abs_error'] for r in pair_data]
+#         # std of absolute errors across repeats — correct uncertainty for
+#         # a mean abs error plot. std_est_dp would be wrong here because
+#         # it measures spread of raw DP estimates, not spread of abs errors.
+#         std_abs_errs = [
+#             float(np.std([rep['abs_error'] for rep in r['repeats']]))
+#             for r in pair_data
+#         ]
+
+#         color = NODE_COLORS[aud_id - 1]
+#         ax.plot(budgets, mean_errs, color=color, linewidth=1.8,
+#                 marker='o', markersize=4, label=f'Auditor N{aud_id}')
+#         ax.fill_between(budgets,
+#                         np.maximum(np.array(mean_errs) - np.array(std_abs_errs), 0),
+#                         np.array(mean_errs) + np.array(std_abs_errs),
+#                         alpha=0.1, color=color)
+
+#     # Full local reference lines — one dashed line per auditor
+#     # coloured to match its budgeted curve, labelled at right edge
+#     for aud_id in auditor_ids:
+#         if aud_id == tgt_id:
+#             continue
+#         full = get_full(aud_id, tgt_id)
+#         if full:
+#             ax.axhline(full['abs_error'], color=NODE_COLORS[aud_id-1],
+#                        linestyle='--', alpha=0.5, linewidth=1)
+#             # Label at right edge so it is clear which auditor it belongs to
+#             ax.text(budget_sizes[-1] * 1.05, full['abs_error'],
+#                     f'N{aud_id} full', fontsize=6,
+#                     color=NODE_COLORS[aud_id-1], va='center', alpha=0.7)
+
+#     # Global auditor reference line — single red dash-dot, same for all auditors
+#     glob = get_global(tgt_id)
+#     if glob:
+#         ax.axhline(glob['abs_error'], color='red',
+#                    linestyle='-.', linewidth=1.5,
+#                    label=f'Global (err={glob["abs_error"]:.3f})')
+#         ax.text(budget_sizes[-1] * 1.05, glob['abs_error'],
+#                 'global', fontsize=6, color='red', va='center')
+
+#     ax.set_title(f'Target: Node {tgt_id}  (true DP={true_dp:.3f})',
+#                  fontweight='bold')
+#     ax.set_xlabel('Query Budget')
+#     ax.set_ylabel('Mean Absolute Error')
+#     ax.set_xscale('log')
+#     ax.legend(fontsize=7)
+#     ax.spines[['top','right']].set_visible(False)
+
+#     # Legend note
+#     ax.text(0.98, 0.98,
+#             'Dashed = full local per auditor\nDash-dot = global auditor',
+#             transform=ax.transAxes, fontsize=6,
+#             ha='right', va='top', color='gray')
+
+# # Hide unused subplots
+# for idx in range(len(target_ids), nrows * ncols):
+#     axes[idx // ncols][idx % ncols].set_visible(False)
+
+# plt.tight_layout()
+# out = os.path.join(PLOT_DIR, 'step5b_per_auditee_budget.png')
+# plt.savefig(out, dpi=150, bbox_inches='tight')
+# plt.close()
+# log.info(f"  ✓ Saved → {out}")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Plot 3: Confidence intervals per (auditor, target) pair per budget
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info("  Generating Plot 3: Confidence interval plot...")
+
+# n_budgets = len(budget_sizes)
+# ncols     = min(3, n_budgets)
+# nrows     = (n_budgets + ncols - 1) // ncols
+
+# fig, axes = plt.subplots(nrows, ncols,
+#                           figsize=(6 * ncols, 4 * nrows),
+#                           squeeze=False)
+# fig.suptitle('Bootstrap 95% Confidence Intervals on Estimated DP Gap\n'
+#              'per Auditor→Target Pair at Each Budget',
+#              fontsize=13, fontweight='bold')
+
+# for idx, budget in enumerate(budget_sizes):
+#     ax      = axes[idx // ncols][idx % ncols]
+#     pairs   = [(aud, tgt)
+#                for aud in auditor_ids for tgt in target_ids
+#                if aud != tgt]
+#     x_ticks = []
+#     x_labels= []
+
+#     for x_pos, (aud_id, tgt_id) in enumerate(pairs):
+#         r = get_budget_agg(aud_id, tgt_id, budget)
+#         if r is None:
+#             continue
+
+#         mean_dp = r['mean_est_dp']
+#         ci_lo   = r['ci_lower']
+#         ci_hi   = r['ci_upper']
+#         true_dp = true_dp_gaps[tgt_id]
+#         color   = NODE_COLORS[aud_id - 1]
+
+#         # CI bar
+#         ax.plot([x_pos, x_pos], [ci_lo, ci_hi],
+#                 color=color, linewidth=2, solid_capstyle='round')
+#         # Mean point
+#         ax.scatter(x_pos, mean_dp, color=color, s=40, zorder=4)
+#         # True DP tick
+#         ax.scatter(x_pos, true_dp, color='black',
+#                    marker='_', s=80, zorder=5, linewidths=2)
+
+#         x_ticks.append(x_pos)
+#         x_labels.append(f'N{aud_id}→N{tgt_id}')
+
+#     ax.set_title(f'Budget = {budget}', fontweight='bold')
+#     ax.set_xticks(x_ticks)
+#     ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=7)
+#     ax.set_ylabel('Estimated DP Gap')
+#     ax.spines[['top','right']].set_visible(False)
+
+#     # Legend
+#     ci_line   = mlines.Line2D([], [], color='gray', linewidth=2,
+#                                label='95% CI')
+#     true_mark = mlines.Line2D([], [], color='black', marker='_',
+#                                markersize=8, linewidth=0,
+#                                label='True DP gap')
+#     ax.legend(handles=[ci_line, true_mark], fontsize=7)
+
+# # Hide unused
+# for idx in range(n_budgets, nrows * ncols):
+#     axes[idx // ncols][idx % ncols].set_visible(False)
+
+# plt.tight_layout()
+# out = os.path.join(PLOT_DIR, 'step5b_confidence_intervals.png')
+# plt.savefig(out, dpi=150, bbox_inches='tight')
+# plt.close()
+# log.info(f"  ✓ Saved → {out}")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Plot 4: Bias vs variance decomposition
+# # bias  = mean(estimated DP) - true DP     (systematic over/underestimation)
+# # variance = std(estimated DP)²            (sensitivity to query sample)
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info("  Generating Plot 4: Bias vs variance decomposition...")
+
+# fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+# fig.suptitle('Bias vs Variance Decomposition of Audit Error\n'
+#              'bias = mean(est DP) − true DP  |  '
+#              'variance = std(est DP)²  |  '
+#              'MSE = bias² + variance',
+#              fontsize=12, fontweight='bold')
+
+# # Collect bias and variance per pair per budget
+# bv_data = {}   # (aud, tgt, budget) → {bias, variance, mse}
+# for r in budget_results:
+#     aud_id  = r['auditor_id']
+#     tgt_id  = r['target_id']
+#     budget  = r['budget']
+#     true_dp = true_dp_gaps[tgt_id]
+
+#     # Extract per-repeat estimates
+#     repeat_ests = [rep['est_dp_gap'] for rep in r['repeats']]
+#     mean_est    = np.mean(repeat_ests)
+#     std_est     = np.std(repeat_ests)
+
+#     bias     = float(mean_est - true_dp)   # signed: positive = overestimate
+#     variance = float(std_est ** 2)
+#     mse      = float(bias ** 2 + variance)
+
+#     bv_data[(aud_id, tgt_id, budget)] = {
+#         'bias': bias, 'variance': variance, 'mse': mse,
+#         'abs_bias': abs(bias)
+#     }
+
+# # Panel 1: |bias| vs budget, averaged across pairs
+# ax = axes[0]
+# mean_bias_per_budget = []
+# std_bias_per_budget  = []
+# for budget in budget_sizes:
+#     abs_biases = [bv_data[(a, t, budget)]['abs_bias']
+#                   for a in auditor_ids for t in target_ids
+#                   if a != t and (a, t, budget) in bv_data]
+#     mean_bias_per_budget.append(np.mean(abs_biases))
+#     std_bias_per_budget.append(np.std(abs_biases))
+
+# m = np.array(mean_bias_per_budget)
+# s = np.array(std_bias_per_budget)
+# ax.plot(budget_sizes, m, color='tomato', linewidth=2,
+#         marker='o', label='Mean |bias|')
+# ax.fill_between(budget_sizes, m - s, m + s, alpha=0.2, color='tomato')
+# ax.set_xlabel('Query Budget'); ax.set_ylabel('|Bias|')
+# ax.set_title('|Bias| vs Budget\n(does more data reduce systematic error?)')
+# ax.set_xscale('log')
+# ax.legend(fontsize=8)
+# ax.spines[['top','right']].set_visible(False)
+
+# # Panel 2: variance vs budget, averaged across pairs
+# ax = axes[1]
+# mean_var_per_budget = []
+# std_var_per_budget  = []
+# for budget in budget_sizes:
+#     variances = [bv_data[(a, t, budget)]['variance']
+#                  for a in auditor_ids for t in target_ids
+#                  if a != t and (a, t, budget) in bv_data]
+#     mean_var_per_budget.append(np.mean(variances))
+#     std_var_per_budget.append(np.std(variances))
+
+# m = np.array(mean_var_per_budget)
+# s = np.array(std_var_per_budget)
+# ax.plot(budget_sizes, m, color='steelblue', linewidth=2,
+#         marker='o', label='Mean variance')
+# ax.fill_between(budget_sizes, np.maximum(m - s, 0), m + s,
+#                 alpha=0.2, color='steelblue')
+# ax.set_xlabel('Query Budget'); ax.set_ylabel('Variance')
+# ax.set_title('Variance vs Budget\n(does more data reduce noise?)')
+# ax.set_xscale('log')
+# ax.legend(fontsize=8)
+# ax.spines[['top','right']].set_visible(False)
+
+# # Panel 3: stacked bias² + variance = MSE at each budget
+# ax = axes[2]
+# mean_bias2 = [np.mean([bv_data[(a,t,b)]['bias']**2
+#                         for a in auditor_ids for t in target_ids
+#                         if a != t and (a,t,b) in bv_data])
+#               for b in budget_sizes]
+# mean_var   = [np.mean([bv_data[(a,t,b)]['variance']
+#                         for a in auditor_ids for t in target_ids
+#                         if a != t and (a,t,b) in bv_data])
+#               for b in budget_sizes]
+
+# x = np.arange(len(budget_sizes))
+# w = 0.5
+# ax.bar(x, mean_bias2, w, label='Bias²',     color='tomato',    alpha=0.85)
+# ax.bar(x, mean_var,   w, bottom=mean_bias2, label='Variance',
+#        color='steelblue', alpha=0.85)
+# ax.set_xticks(x)
+# ax.set_xticklabels([str(b) for b in budget_sizes])
+# ax.set_xlabel('Query Budget'); ax.set_ylabel('MSE')
+# ax.set_title('MSE = Bias² + Variance\n(what drives the error at each budget?)')
+# ax.legend(fontsize=8)
+# ax.spines[['top','right']].set_visible(False)
+
+# plt.tight_layout()
+# out = os.path.join(PLOT_DIR, 'step5b_bias_variance.png')
+# plt.savefig(out, dpi=150, bbox_inches='tight')
+# plt.close()
+# log.info(f"  ✓ Saved → {out}")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Plot 5: Global + full local + budgeted on one axis per target node
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info("  Generating Plot 5: Combined all modes per target...")
+
+# ncols = min(3, len(target_ids))
+# nrows = (len(target_ids) + ncols - 1) // ncols
+# fig, axes = plt.subplots(nrows, ncols,
+#                           figsize=(6 * ncols, 5 * nrows),
+#                           squeeze=False)
+# fig.suptitle('All Audit Modes Combined per Target Node\n'
+#              'Global  |  Full Local  |  Budgeted (with CI)',
+#              fontsize=13, fontweight='bold')
+
+# for idx, tgt_id in enumerate(target_ids):
+#     ax      = axes[idx // ncols][idx % ncols]
+#     true_dp = true_dp_gaps[tgt_id]
+
+#     # True DP reference line
+#     ax.axhline(true_dp, color='black', linestyle='--',
+#                linewidth=1.5, label=f'True DP ({true_dp:.3f})', zorder=1)
+
+#     # Global estimate — horizontal band
+#     glob = get_global(tgt_id)
+#     if glob:
+#         ax.axhline(glob['est_dp_gap'], color='red', linestyle='-.',
+#                    linewidth=1.5,
+#                    label=f'Global ({glob["est_dp_gap"]:.3f})', zorder=2)
+
+#     # For each auditor: full local + budgeted curve
+#     for aud_id in auditor_ids:
+#         if aud_id == tgt_id:
+#             continue
+#         color = NODE_COLORS[aud_id - 1]
+
+#         # Full local — single point at x = max_budget * 1.3 (right side)
+#         full = get_full(aud_id, tgt_id)
+
+#         # Budgeted curve
+#         pair_budget = sorted(
+#             [r for r in budget_results
+#              if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+#             key=lambda r: r['budget']
+#         )
+#         if pair_budget:
+#             budgets   = [r['budget']     for r in pair_budget]
+#             mean_ests = [r['mean_est_dp'] for r in pair_budget]
+#             ci_los    = [r['ci_lower']    for r in pair_budget]
+#             ci_his    = [r['ci_upper']    for r in pair_budget]
+
+#             ax.plot(budgets, mean_ests, color=color, linewidth=1.8,
+#                     marker='o', markersize=4,
+#                     label=f'N{aud_id} budgeted', zorder=3)
+#             ax.fill_between(budgets, ci_los, ci_his,
+#                             alpha=0.15, color=color)
+
+#         # Full local — plotted as a star at x just beyond max budget
+#         if full:
+#             x_full = budget_sizes[-1] * 1.5
+#             ax.scatter(x_full, full['est_dp_gap'],
+#                        color=color, marker='*', s=180, zorder=5)
+
+#     # Add a text label for the star markers
+#     ax.text(0.97, 0.04, '★ = full local',
+#             transform=ax.transAxes, fontsize=7,
+#             ha='right', va='bottom', color='gray')
+
+#     ax.set_title(f'Target: Node {tgt_id}', fontweight='bold')
+#     ax.set_xlabel('Query Budget (★ = full local data)')
+#     ax.set_ylabel('Estimated DP Gap')
+#     ax.set_xscale('log')
+#     ax.legend(fontsize=7, loc='upper right')
+#     ax.spines[['top','right']].set_visible(False)
+
+# # Hide unused subplots
+# for idx in range(len(target_ids), nrows * ncols):
+#     axes[idx // ncols][idx % ncols].set_visible(False)
+
+# plt.tight_layout()
+# out = os.path.join(PLOT_DIR, 'step5b_combined_all_modes.png')
+# plt.savefig(out, dpi=150, bbox_inches='tight')
+# plt.close()
+# log.info(f"  ✓ Saved → {out}")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Plot 6: Per-auditor consistency box plots
+# # For each auditor: distribution of absolute errors across all targets
+# # and all budget sizes. Shows which auditor is most/least consistent.
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info("  Generating Plot 6: Per-auditor consistency box plots...")
+
+# fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+# fig.suptitle('Per-Auditor Consistency\n'
+#              'How much does error vary across different targets?',
+#              fontsize=13, fontweight='bold')
+
+# # Panel 1: full local — box per auditor, one point per target
+# ax = axes[0]
+# full_errors_per_auditor = []
+# labels = []
+# for aud_id in auditor_ids:
+#     errs = [r['abs_error'] for r in full_results
+#             if r['auditor_id'] == aud_id]
+#     full_errors_per_auditor.append(errs)
+#     labels.append(f'Node {aud_id}\n(n={len(errs)})')
+
+# bp = ax.boxplot(full_errors_per_auditor, patch_artist=True,
+#                 medianprops=dict(color='black', linewidth=2))
+# for patch, color in zip(bp['boxes'], NODE_COLORS):
+#     patch.set_facecolor(color)
+#     patch.set_alpha(0.7)
+
+# # Overlay individual points
+# for x_pos, (errs, aud_id) in enumerate(
+#         zip(full_errors_per_auditor, auditor_ids), start=1):
+#     jitter = np.random.default_rng(42).uniform(-0.1, 0.1, len(errs))
+#     ax.scatter(x_pos + jitter, errs,
+#                color=NODE_COLORS[aud_id-1], alpha=0.6, s=40, zorder=3)
+
+# ax.set_xticklabels(labels, fontsize=9)
+# ax.set_ylabel('Absolute Error')
+# ax.set_title('Full Local Audit\nError distribution across targets per auditor')
+# ax.spines[['top','right']].set_visible(False)
+
+# # Panel 2: budgeted — box per auditor at each budget,
+# # grouped by auditor with budget as hue via offset x positions
+# ax = axes[1]
+# n_auditors = len(auditor_ids)
+# n_budgets  = len(budget_sizes)
+# group_width = 0.8
+# bar_width   = group_width / n_budgets
+# budget_colors = plt.cm.Blues(np.linspace(0.3, 0.9, n_budgets))
+
+# for b_idx, budget in enumerate(budget_sizes):
+#     for a_idx, aud_id in enumerate(auditor_ids):
+#         errs = [r['mean_abs_error'] for r in budget_results
+#                 if r['auditor_id'] == aud_id and r['budget'] == budget]
+#         if not errs:
+#             continue
+#         x = a_idx + (b_idx - n_budgets/2 + 0.5) * bar_width
+#         ax.bar(x, np.mean(errs), bar_width * 0.9,
+#                color=budget_colors[b_idx], edgecolor='white',
+#                linewidth=0.5,
+#                label=f'Budget {budget}' if a_idx == 0 else '')
+
+# ax.set_xticks(range(n_auditors))
+# ax.set_xticklabels([f'Node {i}' for i in auditor_ids], fontsize=9)
+# ax.set_ylabel('Mean Absolute Error')
+# ax.set_title('Budgeted Audit\nMean error per auditor at each budget\n'
+#              '(darker = larger budget)')
+# ax.legend(fontsize=7, bbox_to_anchor=(1.01, 1), loc='upper left')
+# ax.spines[['top','right']].set_visible(False)
+
+# plt.tight_layout()
+# out = os.path.join(PLOT_DIR, 'step5b_auditor_consistency.png')
+# plt.savefig(out, dpi=150, bbox_inches='tight')
+# plt.close()
+# log.info(f"  ✓ Saved → {out}")
+
+
+# # ─────────────────────────────────────────────────────────────────────────────
+# # Summary
+# # ─────────────────────────────────────────────────────────────────────────────
+# log.info(f"\n{'='*70}")
+# log.info("  Step 5b Complete")
+# log.info(f"{'='*70}")
+# log.info(f"\n  All plots saved to: {PLOT_DIR}")
+# log.info(f"    step5b_budget_labelled.png")
+# log.info(f"    step5b_per_auditee_budget.png")
+# log.info(f"    step5b_confidence_intervals.png")
+# log.info(f"    step5b_bias_variance.png")
+# log.info(f"    step5b_combined_all_modes.png")
+# log.info(f"    step5b_auditor_consistency.png")
+# log.info(f"    logs/step5b.log")
+# log.info(f"{'='*70}")
+
+
+
+
+
+# # """
+# # Step 5 Extra Plots
+# # ===================
+# # Reads from already-generated step5_audit_results.json and produces
+# # additional visualisations. No re-running of audits needed.
+
+# # Run with:
+# #     python step5_extra_plots.py
+# #     python3 step_5_audit_extra_plots.py --config config.yaml
+
+# # Produces:
+# #     plots/step5b_budget_labelled.png           (1) fixed budget labels
+# #     plots/step5b_per_auditee_budget.png        (2) per-auditee budget curves
+# #     plots/step5b_confidence_intervals.png      (3) CI plot per pair per budget
+# #     plots/step5b_bias_variance.png             (4) bias vs variance decomposition
+# #     plots/step5b_combined_all_modes.png        (5) global + local + budgeted together
+# #     plots/step5b_auditor_consistency.png       (6) per-auditor consistency box plots
+# # """
+
+# # import os
+# # import sys
+# # import json
+# # import argparse
+# # import logging
+# # import numpy as np
+# # import matplotlib
+# # matplotlib.use('Agg')
+# # import matplotlib.pyplot as plt
+# # import matplotlib.lines as mlines
+# # from scipy import stats as scipy_stats
+# # import yaml
+
+# # # ── Argument parsing ───────────────────────────────────────────────────────────
+# # parser = argparse.ArgumentParser(description='Step 5 Extra Plots')
+# # parser.add_argument('--config', type=str, default='config.yaml')
+# # args = parser.parse_args()
+
+# # with open(args.config) as f:
+# #     cfg = yaml.safe_load(f)
+
+# # EXP_NAME  = cfg['experiment']['name']
+# # NUM_NODES = cfg['partition']['num_nodes']
+# # NFS_ROOT  = os.environ.get('NFS_ROOT', cfg['nfs']['root'])
+# # EXP_DIR   = os.path.join(NFS_ROOT, 'experiments', EXP_NAME)
+# # PLOT_DIR  = os.path.join(EXP_DIR, 'plots')
+# # LOG_DIR   = os.path.join(EXP_DIR, 'logs')
+
+# # os.makedirs(PLOT_DIR, exist_ok=True)
+
+# # # ── Logging ────────────────────────────────────────────────────────────────────
+# # log_path = os.path.join(LOG_DIR, 'step5b.log')
+# # logging.basicConfig(
+# #     level=logging.INFO,
+# #     format='%(message)s',
+# #     handlers=[
+# #         logging.StreamHandler(sys.stdout),
+# #         logging.FileHandler(log_path, mode='w')
+# #     ]
+# # )
+# # log = logging.getLogger()
+
+# # # ── Style constants ────────────────────────────────────────────────────────────
+# # NODE_COLORS   = ['steelblue', 'salmon', 'mediumseagreen', 'mediumpurple', 'sandybrown']
+# # LINE_STYLES   = ['-', '--', '-.', ':', (0,(3,1,1,1))]   # one per target node
+# # MARKER_STYLES = ['o', 's', '^', 'D', 'v']
+
+# # # ── Load results ───────────────────────────────────────────────────────────────
+# # log.info("=" * 70)
+# # log.info("  Step 5b: Extra Plots")
+# # log.info("=" * 70)
+
+# # results_path = os.path.join(EXP_DIR, 'results', 'step5_audit_results.json')
+# # log.info(f"\n  Loading results from {results_path}...")
+# # with open(results_path) as f:
+# #     data = json.load(f)
+
+# # full_results   = data['full_results']
+# # budget_results = data['budget_results']
+# # global_results = data['global_results']
+# # true_dp_gaps   = {int(k): v for k, v in data['true_dp_gaps'].items()}
+# # budget_sizes   = sorted(set(r['budget'] for r in budget_results))
+# # auditor_ids    = sorted(set(r['auditor_id'] for r in full_results))
+# # target_ids     = sorted(true_dp_gaps.keys())
+
+# # log.info(f"  ✓ Loaded")
+# # log.info(f"    Full results   : {len(full_results)}")
+# # log.info(f"    Budget results : {len(budget_results)}")
+# # log.info(f"    Global results : {len(global_results)}")
+# # log.info(f"    Budget sizes   : {budget_sizes}")
+# # log.info(f"    Nodes          : {NUM_NODES}\n")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Helper: get budget-aggregated result for a specific (auditor, target, budget)
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # def get_budget_agg(auditor_id, target_id, budget):
+# #     matches = [r for r in budget_results
+# #                if r['auditor_id'] == auditor_id
+# #                and r['target_id'] == target_id
+# #                and r['budget'] == budget]
+# #     return matches[0] if matches else None
+
+
+# # def get_full(auditor_id, target_id):
+# #     matches = [r for r in full_results
+# #                if r['auditor_id'] == auditor_id
+# #                and r['target_id'] == target_id]
+# #     return matches[0] if matches else None
+
+
+# # def get_global(target_id):
+# #     matches = [r for r in global_results if r['target_id'] == target_id]
+# #     return matches[0] if matches else None
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Plot 1: Budget curves with proper N1→N3 labels
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info("  Generating Plot 1: Budget curves with N_aud→N_tgt labels...")
+
+# # fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+# # fig.suptitle('Budgeted Audit — Sample Efficiency\n'
+# #              'Label format: Nauditor→Ntarget',
+# #              fontsize=13, fontweight='bold')
+
+# # # Left panel: abs error vs budget, one line per pair
+# # ax = axes[0]
+# # for aud_id in auditor_ids:
+# #     for tgt_id in target_ids:
+# #         if aud_id == tgt_id:
+# #             continue
+# #         pair_data = sorted(
+# #             [r for r in budget_results
+# #              if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+# #             key=lambda r: r['budget']
+# #         )
+# #         if not pair_data:
+# #             continue
+# #         budgets   = [r['budget']         for r in pair_data]
+# #         mean_errs = [r['mean_abs_error'] for r in pair_data]
+# #         std_errs  = [r['std_est_dp']     for r in pair_data]
+
+# #         color     = NODE_COLORS[aud_id - 1]
+# #         linestyle = LINE_STYLES[(tgt_id - 1) % len(LINE_STYLES)]
+# #         label     = f'N{aud_id}→N{tgt_id}'
+
+# #         ax.plot(budgets, mean_errs, color=color, linestyle=linestyle,
+# #                 linewidth=1.5, marker=MARKER_STYLES[tgt_id-1],
+# #                 markersize=4, label=label)
+
+# # ax.set_xlabel('Query Budget')
+# # ax.set_ylabel('Mean Absolute Error')
+# # ax.set_title('All Pairs (colour=auditor, style=target)')
+# # ax.set_xscale('log')
+# # ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left',
+# #           fontsize=7, ncol=1)
+# # ax.spines[['top','right']].set_visible(False)
+
+# # # Right panel: averaged across all pairs with std shading
+# # ax = axes[1]
+# # mean_per_budget = []
+# # std_per_budget  = []
+# # for budget in budget_sizes:
+# #     errs = [r['mean_abs_error'] for r in budget_results
+# #             if r['budget'] == budget]
+# #     mean_per_budget.append(np.mean(errs))
+# #     std_per_budget.append(np.std(errs))
+
+# # m = np.array(mean_per_budget)
+# # s = np.array(std_per_budget)
+# # ax.plot(budget_sizes, m, color='steelblue', linewidth=2,
+# #         marker='o', label='Mean ± std across all pairs')
+# # ax.fill_between(budget_sizes, m - s, m + s,
+# #                 alpha=0.2, color='steelblue')
+
+# # # Mark each budget size
+# # for b, mv in zip(budget_sizes, m):
+# #     ax.annotate(f'{b}', xy=(b, mv), xytext=(0, 8),
+# #                 textcoords='offset points', ha='center',
+# #                 fontsize=8, color='steelblue')
+
+# # ax.set_xlabel('Query Budget')
+# # ax.set_ylabel('Mean Absolute Error')
+# # ax.set_title('Averaged Across All Pairs\n(shading = ±1 std)')
+# # ax.set_xscale('log')
+# # ax.legend(fontsize=9)
+# # ax.spines[['top','right']].set_visible(False)
+
+# # plt.tight_layout()
+# # out = os.path.join(PLOT_DIR, 'step5b_budget_labelled.png')
+# # plt.savefig(out, dpi=150, bbox_inches='tight')
+# # plt.close()
+# # log.info(f"  ✓ Saved → {out}")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Plot 2: Per-auditee budget curves
+# # # One subplot per target node. Each line = one auditor.
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info("  Generating Plot 2: Per-auditee budget curves...")
+
+# # ncols = min(3, len(target_ids))
+# # nrows = (len(target_ids) + ncols - 1) // ncols
+# # fig, axes = plt.subplots(nrows, ncols,
+# #                           figsize=(5 * ncols, 4 * nrows),
+# #                           squeeze=False)
+# # fig.suptitle('Per-Auditee Budget Curves\n'
+# #              'How does each auditor\'s accuracy improve with more queries?',
+# #              fontsize=13, fontweight='bold')
+
+# # for idx, tgt_id in enumerate(target_ids):
+# #     ax       = axes[idx // ncols][idx % ncols]
+# #     true_dp  = true_dp_gaps[tgt_id]
+
+# #     for aud_id in auditor_ids:
+# #         if aud_id == tgt_id:
+# #             continue
+# #         pair_data = sorted(
+# #             [r for r in budget_results
+# #              if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+# #             key=lambda r: r['budget']
+# #         )
+# #         if not pair_data:
+# #             continue
+# #         budgets   = [r['budget']         for r in pair_data]
+# #         mean_errs = [r['mean_abs_error'] for r in pair_data]
+# #         std_errs  = [r['std_est_dp']     for r in pair_data]
+
+# #         color = NODE_COLORS[aud_id - 1]
+# #         ax.plot(budgets, mean_errs, color=color, linewidth=1.8,
+# #                 marker='o', markersize=4, label=f'Auditor N{aud_id}')
+# #         ax.fill_between(budgets,
+# #                         np.array(mean_errs) - np.array(std_errs),
+# #                         np.array(mean_errs) + np.array(std_errs),
+# #                         alpha=0.1, color=color)
+
+# #     # Full local reference lines — one dashed line per auditor
+# #     # coloured to match its budgeted curve, labelled at right edge
+# #     for aud_id in auditor_ids:
+# #         if aud_id == tgt_id:
+# #             continue
+# #         full = get_full(aud_id, tgt_id)
+# #         if full:
+# #             ax.axhline(full['abs_error'], color=NODE_COLORS[aud_id-1],
+# #                        linestyle='--', alpha=0.5, linewidth=1)
+# #             # Label at right edge so it is clear which auditor it belongs to
+# #             ax.text(budget_sizes[-1] * 1.05, full['abs_error'],
+# #                     f'N{aud_id} full', fontsize=6,
+# #                     color=NODE_COLORS[aud_id-1], va='center', alpha=0.7)
+
+# #     # Global auditor reference line — single red dash-dot, same for all auditors
+# #     glob = get_global(tgt_id)
+# #     if glob:
+# #         ax.axhline(glob['abs_error'], color='red',
+# #                    linestyle='-.', linewidth=1.5,
+# #                    label=f'Global (err={glob["abs_error"]:.3f})')
+# #         ax.text(budget_sizes[-1] * 1.05, glob['abs_error'],
+# #                 'global', fontsize=6, color='red', va='center')
+
+# #     ax.set_title(f'Target: Node {tgt_id}  (true DP={true_dp:.3f})',
+# #                  fontweight='bold')
+# #     ax.set_xlabel('Query Budget')
+# #     ax.set_ylabel('Mean Absolute Error')
+# #     ax.set_xscale('log')
+# #     ax.legend(fontsize=7)
+# #     ax.spines[['top','right']].set_visible(False)
+
+# #     # Legend note
+# #     ax.text(0.98, 0.98,
+# #             'Dashed = full local per auditor\nDash-dot = global auditor',
+# #             transform=ax.transAxes, fontsize=6,
+# #             ha='right', va='top', color='gray')
+
+# # # Hide unused subplots
+# # for idx in range(len(target_ids), nrows * ncols):
+# #     axes[idx // ncols][idx % ncols].set_visible(False)
+
+# # plt.tight_layout()
+# # out = os.path.join(PLOT_DIR, 'step5b_per_auditee_budget.png')
+# # plt.savefig(out, dpi=150, bbox_inches='tight')
+# # plt.close()
+# # log.info(f"  ✓ Saved → {out}")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Plot 3: Confidence intervals per (auditor, target) pair per budget
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info("  Generating Plot 3: Confidence interval plot...")
+
+# # n_budgets = len(budget_sizes)
+# # ncols     = min(3, n_budgets)
+# # nrows     = (n_budgets + ncols - 1) // ncols
+
+# # fig, axes = plt.subplots(nrows, ncols,
+# #                           figsize=(6 * ncols, 4 * nrows),
+# #                           squeeze=False)
+# # fig.suptitle('Bootstrap 95% Confidence Intervals on Estimated DP Gap\n'
+# #              'per Auditor→Target Pair at Each Budget',
+# #              fontsize=13, fontweight='bold')
+
+# # for idx, budget in enumerate(budget_sizes):
+# #     ax      = axes[idx // ncols][idx % ncols]
+# #     pairs   = [(aud, tgt)
+# #                for aud in auditor_ids for tgt in target_ids
+# #                if aud != tgt]
+# #     x_ticks = []
+# #     x_labels= []
+
+# #     for x_pos, (aud_id, tgt_id) in enumerate(pairs):
+# #         r = get_budget_agg(aud_id, tgt_id, budget)
+# #         if r is None:
+# #             continue
+
+# #         mean_dp = r['mean_est_dp']
+# #         ci_lo   = r['ci_lower']
+# #         ci_hi   = r['ci_upper']
+# #         true_dp = true_dp_gaps[tgt_id]
+# #         color   = NODE_COLORS[aud_id - 1]
+
+# #         # CI bar
+# #         ax.plot([x_pos, x_pos], [ci_lo, ci_hi],
+# #                 color=color, linewidth=2, solid_capstyle='round')
+# #         # Mean point
+# #         ax.scatter(x_pos, mean_dp, color=color, s=40, zorder=4)
+# #         # True DP tick
+# #         ax.scatter(x_pos, true_dp, color='black',
+# #                    marker='_', s=80, zorder=5, linewidths=2)
+
+# #         x_ticks.append(x_pos)
+# #         x_labels.append(f'N{aud_id}→N{tgt_id}')
+
+# #     ax.set_title(f'Budget = {budget}', fontweight='bold')
+# #     ax.set_xticks(x_ticks)
+# #     ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=7)
+# #     ax.set_ylabel('Estimated DP Gap')
+# #     ax.spines[['top','right']].set_visible(False)
+
+# #     # Legend
+# #     ci_line   = mlines.Line2D([], [], color='gray', linewidth=2,
+# #                                label='95% CI')
+# #     true_mark = mlines.Line2D([], [], color='black', marker='_',
+# #                                markersize=8, linewidth=0,
+# #                                label='True DP gap')
+# #     ax.legend(handles=[ci_line, true_mark], fontsize=7)
+
+# # # Hide unused
+# # for idx in range(n_budgets, nrows * ncols):
+# #     axes[idx // ncols][idx % ncols].set_visible(False)
+
+# # plt.tight_layout()
+# # out = os.path.join(PLOT_DIR, 'step5b_confidence_intervals.png')
+# # plt.savefig(out, dpi=150, bbox_inches='tight')
+# # plt.close()
+# # log.info(f"  ✓ Saved → {out}")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Plot 4: Bias vs variance decomposition
+# # # bias  = mean(estimated DP) - true DP     (systematic over/underestimation)
+# # # variance = std(estimated DP)²            (sensitivity to query sample)
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info("  Generating Plot 4: Bias vs variance decomposition...")
+
+# # fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+# # fig.suptitle('Bias vs Variance Decomposition of Audit Error\n'
+# #              'bias = mean(est DP) − true DP  |  '
+# #              'variance = std(est DP)²  |  '
+# #              'MSE = bias² + variance',
+# #              fontsize=12, fontweight='bold')
+
+# # # Collect bias and variance per pair per budget
+# # bv_data = {}   # (aud, tgt, budget) → {bias, variance, mse}
+# # for r in budget_results:
+# #     aud_id  = r['auditor_id']
+# #     tgt_id  = r['target_id']
+# #     budget  = r['budget']
+# #     true_dp = true_dp_gaps[tgt_id]
+
+# #     # Extract per-repeat estimates
+# #     repeat_ests = [rep['est_dp_gap'] for rep in r['repeats']]
+# #     mean_est    = np.mean(repeat_ests)
+# #     std_est     = np.std(repeat_ests)
+
+# #     bias     = float(mean_est - true_dp)   # signed: positive = overestimate
+# #     variance = float(std_est ** 2)
+# #     mse      = float(bias ** 2 + variance)
+
+# #     bv_data[(aud_id, tgt_id, budget)] = {
+# #         'bias': bias, 'variance': variance, 'mse': mse,
+# #         'abs_bias': abs(bias)
+# #     }
+
+# # # Panel 1: |bias| vs budget, averaged across pairs
+# # ax = axes[0]
+# # mean_bias_per_budget = []
+# # std_bias_per_budget  = []
+# # for budget in budget_sizes:
+# #     abs_biases = [bv_data[(a, t, budget)]['abs_bias']
+# #                   for a in auditor_ids for t in target_ids
+# #                   if a != t and (a, t, budget) in bv_data]
+# #     mean_bias_per_budget.append(np.mean(abs_biases))
+# #     std_bias_per_budget.append(np.std(abs_biases))
+
+# # m = np.array(mean_bias_per_budget)
+# # s = np.array(std_bias_per_budget)
+# # ax.plot(budget_sizes, m, color='tomato', linewidth=2,
+# #         marker='o', label='Mean |bias|')
+# # ax.fill_between(budget_sizes, m - s, m + s, alpha=0.2, color='tomato')
+# # ax.set_xlabel('Query Budget'); ax.set_ylabel('|Bias|')
+# # ax.set_title('|Bias| vs Budget\n(does more data reduce systematic error?)')
+# # ax.set_xscale('log')
+# # ax.legend(fontsize=8)
+# # ax.spines[['top','right']].set_visible(False)
+
+# # # Panel 2: variance vs budget, averaged across pairs
+# # ax = axes[1]
+# # mean_var_per_budget = []
+# # std_var_per_budget  = []
+# # for budget in budget_sizes:
+# #     variances = [bv_data[(a, t, budget)]['variance']
+# #                  for a in auditor_ids for t in target_ids
+# #                  if a != t and (a, t, budget) in bv_data]
+# #     mean_var_per_budget.append(np.mean(variances))
+# #     std_var_per_budget.append(np.std(variances))
+
+# # m = np.array(mean_var_per_budget)
+# # s = np.array(std_var_per_budget)
+# # ax.plot(budget_sizes, m, color='steelblue', linewidth=2,
+# #         marker='o', label='Mean variance')
+# # ax.fill_between(budget_sizes, np.maximum(m - s, 0), m + s,
+# #                 alpha=0.2, color='steelblue')
+# # ax.set_xlabel('Query Budget'); ax.set_ylabel('Variance')
+# # ax.set_title('Variance vs Budget\n(does more data reduce noise?)')
+# # ax.set_xscale('log')
+# # ax.legend(fontsize=8)
+# # ax.spines[['top','right']].set_visible(False)
+
+# # # Panel 3: stacked bias² + variance = MSE at each budget
+# # ax = axes[2]
+# # mean_bias2 = [np.mean([bv_data[(a,t,b)]['bias']**2
+# #                         for a in auditor_ids for t in target_ids
+# #                         if a != t and (a,t,b) in bv_data])
+# #               for b in budget_sizes]
+# # mean_var   = [np.mean([bv_data[(a,t,b)]['variance']
+# #                         for a in auditor_ids for t in target_ids
+# #                         if a != t and (a,t,b) in bv_data])
+# #               for b in budget_sizes]
+
+# # x = np.arange(len(budget_sizes))
+# # w = 0.5
+# # ax.bar(x, mean_bias2, w, label='Bias²',     color='tomato',    alpha=0.85)
+# # ax.bar(x, mean_var,   w, bottom=mean_bias2, label='Variance',
+# #        color='steelblue', alpha=0.85)
+# # ax.set_xticks(x)
+# # ax.set_xticklabels([str(b) for b in budget_sizes])
+# # ax.set_xlabel('Query Budget'); ax.set_ylabel('MSE')
+# # ax.set_title('MSE = Bias² + Variance\n(what drives the error at each budget?)')
+# # ax.legend(fontsize=8)
+# # ax.spines[['top','right']].set_visible(False)
+
+# # plt.tight_layout()
+# # out = os.path.join(PLOT_DIR, 'step5b_bias_variance.png')
+# # plt.savefig(out, dpi=150, bbox_inches='tight')
+# # plt.close()
+# # log.info(f"  ✓ Saved → {out}")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Plot 5: Global + full local + budgeted on one axis per target node
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info("  Generating Plot 5: Combined all modes per target...")
+
+# # ncols = min(3, len(target_ids))
+# # nrows = (len(target_ids) + ncols - 1) // ncols
+# # fig, axes = plt.subplots(nrows, ncols,
+# #                           figsize=(6 * ncols, 5 * nrows),
+# #                           squeeze=False)
+# # fig.suptitle('All Audit Modes Combined per Target Node\n'
+# #              'Global  |  Full Local  |  Budgeted (with CI)',
+# #              fontsize=13, fontweight='bold')
+
+# # for idx, tgt_id in enumerate(target_ids):
+# #     ax      = axes[idx // ncols][idx % ncols]
+# #     true_dp = true_dp_gaps[tgt_id]
+
+# #     # True DP reference line
+# #     ax.axhline(true_dp, color='black', linestyle='--',
+# #                linewidth=1.5, label=f'True DP ({true_dp:.3f})', zorder=1)
+
+# #     # Global estimate — horizontal band
+# #     glob = get_global(tgt_id)
+# #     if glob:
+# #         ax.axhline(glob['est_dp_gap'], color='red', linestyle='-.',
+# #                    linewidth=1.5,
+# #                    label=f'Global ({glob["est_dp_gap"]:.3f})', zorder=2)
+
+# #     # For each auditor: full local + budgeted curve
+# #     for aud_id in auditor_ids:
+# #         if aud_id == tgt_id:
+# #             continue
+# #         color = NODE_COLORS[aud_id - 1]
+
+# #         # Full local — single point at x = max_budget * 1.3 (right side)
+# #         full = get_full(aud_id, tgt_id)
+
+# #         # Budgeted curve
+# #         pair_budget = sorted(
+# #             [r for r in budget_results
+# #              if r['auditor_id'] == aud_id and r['target_id'] == tgt_id],
+# #             key=lambda r: r['budget']
+# #         )
+# #         if pair_budget:
+# #             budgets   = [r['budget']     for r in pair_budget]
+# #             mean_ests = [r['mean_est_dp'] for r in pair_budget]
+# #             ci_los    = [r['ci_lower']    for r in pair_budget]
+# #             ci_his    = [r['ci_upper']    for r in pair_budget]
+
+# #             ax.plot(budgets, mean_ests, color=color, linewidth=1.8,
+# #                     marker='o', markersize=4,
+# #                     label=f'N{aud_id} budgeted', zorder=3)
+# #             ax.fill_between(budgets, ci_los, ci_his,
+# #                             alpha=0.15, color=color)
+
+# #         # Full local — plotted as a star at x just beyond max budget
+# #         if full:
+# #             x_full = budget_sizes[-1] * 1.5
+# #             ax.scatter(x_full, full['est_dp_gap'],
+# #                        color=color, marker='*', s=180, zorder=5)
+
+# #     # Add a text label for the star markers
+# #     ax.text(0.97, 0.04, '★ = full local',
+# #             transform=ax.transAxes, fontsize=7,
+# #             ha='right', va='bottom', color='gray')
+
+# #     ax.set_title(f'Target: Node {tgt_id}', fontweight='bold')
+# #     ax.set_xlabel('Query Budget (★ = full local data)')
+# #     ax.set_ylabel('Estimated DP Gap')
+# #     ax.set_xscale('log')
+# #     ax.legend(fontsize=7, loc='upper right')
+# #     ax.spines[['top','right']].set_visible(False)
+
+# # # Hide unused subplots
+# # for idx in range(len(target_ids), nrows * ncols):
+# #     axes[idx // ncols][idx % ncols].set_visible(False)
+
+# # plt.tight_layout()
+# # out = os.path.join(PLOT_DIR, 'step5b_combined_all_modes.png')
+# # plt.savefig(out, dpi=150, bbox_inches='tight')
+# # plt.close()
+# # log.info(f"  ✓ Saved → {out}")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Plot 6: Per-auditor consistency box plots
+# # # For each auditor: distribution of absolute errors across all targets
+# # # and all budget sizes. Shows which auditor is most/least consistent.
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info("  Generating Plot 6: Per-auditor consistency box plots...")
+
+# # fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+# # fig.suptitle('Per-Auditor Consistency\n'
+# #              'How much does error vary across different targets?',
+# #              fontsize=13, fontweight='bold')
+
+# # # Panel 1: full local — box per auditor, one point per target
+# # ax = axes[0]
+# # full_errors_per_auditor = []
+# # labels = []
+# # for aud_id in auditor_ids:
+# #     errs = [r['abs_error'] for r in full_results
+# #             if r['auditor_id'] == aud_id]
+# #     full_errors_per_auditor.append(errs)
+# #     labels.append(f'Node {aud_id}\n(n={len(errs)})')
+
+# # bp = ax.boxplot(full_errors_per_auditor, patch_artist=True,
+# #                 medianprops=dict(color='black', linewidth=2))
+# # for patch, color in zip(bp['boxes'], NODE_COLORS):
+# #     patch.set_facecolor(color)
+# #     patch.set_alpha(0.7)
+
+# # # Overlay individual points
+# # for x_pos, (errs, aud_id) in enumerate(
+# #         zip(full_errors_per_auditor, auditor_ids), start=1):
+# #     jitter = np.random.default_rng(42).uniform(-0.1, 0.1, len(errs))
+# #     ax.scatter(x_pos + jitter, errs,
+# #                color=NODE_COLORS[aud_id-1], alpha=0.6, s=40, zorder=3)
+
+# # ax.set_xticklabels(labels, fontsize=9)
+# # ax.set_ylabel('Absolute Error')
+# # ax.set_title('Full Local Audit\nError distribution across targets per auditor')
+# # ax.spines[['top','right']].set_visible(False)
+
+# # # Panel 2: budgeted — box per auditor at each budget,
+# # # grouped by auditor with budget as hue via offset x positions
+# # ax = axes[1]
+# # n_auditors = len(auditor_ids)
+# # n_budgets  = len(budget_sizes)
+# # group_width = 0.8
+# # bar_width   = group_width / n_budgets
+# # budget_colors = plt.cm.Blues(np.linspace(0.3, 0.9, n_budgets))
+
+# # for b_idx, budget in enumerate(budget_sizes):
+# #     for a_idx, aud_id in enumerate(auditor_ids):
+# #         errs = [r['mean_abs_error'] for r in budget_results
+# #                 if r['auditor_id'] == aud_id and r['budget'] == budget]
+# #         if not errs:
+# #             continue
+# #         x = a_idx + (b_idx - n_budgets/2 + 0.5) * bar_width
+# #         ax.bar(x, np.mean(errs), bar_width * 0.9,
+# #                color=budget_colors[b_idx], edgecolor='white',
+# #                linewidth=0.5,
+# #                label=f'Budget {budget}' if a_idx == 0 else '')
+
+# # ax.set_xticks(range(n_auditors))
+# # ax.set_xticklabels([f'Node {i}' for i in auditor_ids], fontsize=9)
+# # ax.set_ylabel('Mean Absolute Error')
+# # ax.set_title('Budgeted Audit\nMean error per auditor at each budget\n'
+# #              '(darker = larger budget)')
+# # ax.legend(fontsize=7, bbox_to_anchor=(1.01, 1), loc='upper left')
+# # ax.spines[['top','right']].set_visible(False)
+
+# # plt.tight_layout()
+# # out = os.path.join(PLOT_DIR, 'step5b_auditor_consistency.png')
+# # plt.savefig(out, dpi=150, bbox_inches='tight')
+# # plt.close()
+# # log.info(f"  ✓ Saved → {out}")
+
+
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # # Summary
+# # # ─────────────────────────────────────────────────────────────────────────────
+# # log.info(f"\n{'='*70}")
+# # log.info("  Step 5b Complete")
+# # log.info(f"{'='*70}")
+# # log.info(f"\n  All plots saved to: {PLOT_DIR}")
+# # log.info(f"    step5b_budget_labelled.png")
+# # log.info(f"    step5b_per_auditee_budget.png")
+# # log.info(f"    step5b_confidence_intervals.png")
+# # log.info(f"    step5b_bias_variance.png")
+# # log.info(f"    step5b_combined_all_modes.png")
+# # log.info(f"    step5b_auditor_consistency.png")
+# # log.info(f"    logs/step5b.log")
+# # log.info(f"{'='*70}")

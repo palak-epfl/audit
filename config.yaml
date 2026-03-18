@@ -1,0 +1,69 @@
+experiment:
+    name: "lenet_alpha0.5_5nodes_seed42"
+    notes: "Single LeNet baseline, full CelebA, gender sensitive attr"
+
+# ── NFS paths ─────────────────────────────────────────────────
+# Set NFS_ROOT env var to override, e.g.:
+#   NFS_ROOT=/scratch/yourname python3 step2_train_baseline.py
+#
+# Final folder structure on NFS:
+#   {nfs_root}/
+#   ├── hf_cache/                        ← HuggingFace dataset cache (shared across runs)
+#   └── experiments/
+#       └── {experiment.name}/
+#           ├── config.yaml              ← copy of this config (auto-saved)
+#           ├── checkpoints/
+#           │   ├── baseline_best.pt
+#           │   ├── node_1_best.pt
+#           │   └── ...
+#           ├── partitions/
+#           │   └── partition_alpha0.5.json
+#           ├── results/
+#           │   ├── step2_baseline_results.json
+#           │   ├── step4_node_results.json
+#           │   └── step5_audit_results.json
+#           └── plots/
+#               ├── step1_distributions.png
+#               ├── step2_training_curves.png
+#               └── ...
+nfs:
+    root: "/mnt/nfs/home/palak/data/models/audit/" # ← change this to your NFS mount path
+
+# ── Dataset ───────────────────────────────────────────────────
+dataset:
+    name: "flwrlabs/celeba"
+    split: "train"
+    sensitive_attr: "Male"
+    target_attr: "Smiling"
+
+# ── Model ─────────────────────────────────────────────────────
+model:
+    image_size: 64
+    in_channels: 3
+    num_classes: 2
+    dropout: 0.5
+
+# ── Training ──────────────────────────────────────────────────
+training:
+    epochs: 20
+    batch_size: 256
+    lr: 0.001
+    seed: 42
+    val_split: 0.1
+    patience: 5
+    lr_factor: 0.5
+    lr_patience: 3
+    num_workers: 4
+
+# ── Partitioning ──────────────────────────────────────────────
+partition:
+    num_nodes: 5
+    alpha: 0.5
+    min_samples: 10000
+    seed: 42
+    partition_attr: "High_Cheekbones" 
+
+# ── Auditing ──────────────────────────────────────────────────
+audit:
+    query_size: 500
+    seed: 42
