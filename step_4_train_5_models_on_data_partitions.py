@@ -256,7 +256,7 @@ def plot_training_curves(history, node_id, stopped_epoch, plot_dir):
     axes[1].legend(); axes[1].spines[['top','right']].set_visible(False)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, f'step4_node_{node_id}_training_curves.png')
+    out = os.path.join(plot_dir, f'step4_node_{node_id}_{PARTITION_ATTR}_training_curves.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -285,7 +285,7 @@ def plot_node_dp_gap(result, node_id, plot_dir):
         ax.spines[['top','right']].set_visible(False)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, f'step4_node_{node_id}_dp_gap.png')
+    out = os.path.join(plot_dir, f'step4_node_{node_id}_{PARTITION_ATTR}_dp_gap.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -313,9 +313,9 @@ def train_node(node_id, gpu_id, dataset, node_indices, result_queue,
     try:
         # ── Resume check — skip training if checkpoint + results already exist ──
         ckpt_path_check   = os.path.join(nfs_paths['ckpt_dir'],
-                                         f'node_{node_id}_best.pt')
+                                         f'node_{node_id}_{PARTITION_ATTR}_best.pt')
         results_path_check = os.path.join(nfs_paths['results_dir'],
-                                          f'step4_node_{node_id}_results.json')
+                                          f'step4_node_{node_id}_{PARTITION_ATTR}_results.json')
 
         if os.path.exists(ckpt_path_check) and os.path.exists(results_path_check):
             print(f'{tag} Checkpoint and results already exist — skipping training.',
@@ -377,7 +377,7 @@ def train_node(node_id, gpu_id, dataset, node_indices, result_queue,
         epochs_no_improve = 0
         best_epoch        = 1
         ckpt_path         = os.path.join(nfs_paths['ckpt_dir'],
-                                         f'node_{node_id}_best.pt')
+                                         f'node_{node_id}_{PARTITION_ATTR}_best.pt')
 
         for epoch in range(1, cfg['training']['epochs'] + 1):
             train_loss, train_acc = train_one_epoch(
@@ -457,7 +457,7 @@ def train_node(node_id, gpu_id, dataset, node_indices, result_queue,
 
         # Save per-node JSON immediately — survives if later nodes fail
         node_results_path = os.path.join(
-            nfs_paths['results_dir'], f'step4_node_{node_id}_results.json')
+            nfs_paths['results_dir'], f'step4_node_{node_id}_{PARTITION_ATTR}_results.json')
         result_to_save = {k: v for k, v in result.items() if k != 'history'}
         result_to_save['history'] = history
         with open(node_results_path, 'w') as f:
@@ -508,7 +508,7 @@ def plot_summary_dp_gaps(all_results, dp_gap_global, plot_dir):
     ax.set_ylabel('DP gap'); ax.set_xticks(x); ax.set_xticklabels(node_lbls)
     ax.legend(); ax.spines[['top','right']].set_visible(False)
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step4_summary_dp_gaps.png')
+    out = os.path.join(plot_dir, f'step4_summary_dp_gaps_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -540,7 +540,7 @@ def plot_summary_training_curves(all_results, plot_dir):
     axes[1].legend(); axes[1].spines[['top','right']].set_visible(False)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step4_summary_training_curves.png')
+    out = os.path.join(plot_dir, f'step4_summary_training_curves_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -723,7 +723,7 @@ def main():
         'nodes'         : [{k: v for k, v in r.items() if k != 'history'}
                            for r in all_results],
     }
-    combined_path = os.path.join(RESULTS_DIR, 'step4_all_nodes_results.json')
+    combined_path = os.path.join(RESULTS_DIR, f'step4_all_nodes_{PARTITION_ATTR}_results.json')
     with open(combined_path, 'w') as f:
         json.dump(combined, f, indent=2)
     log.info(f"  ✓ Saved → {combined_path}")
@@ -745,9 +745,9 @@ def main():
              f"{max(dp_data_gaps):.4f}")
     log.info(f"\n  Per-node outputs:")
     for r in all_results:
-        log.info(f"    Node {r['node_id']}: checkpoints/node_{r['node_id']}_best.pt  |  "
-                 f"plots/step4_node_{r['node_id']}_*.png  |  "
-                 f"results/step4_node_{r['node_id']}_results.json")
+        log.info(f"    Node {r['node_id']}: checkpoints/node_{r['node_id']}_{PARTITION_ATTR}_best.pt  |  "
+                 f"plots/step4_node_{r['node_id']}_{PARTITION_ATTR}_*.png  |  "
+                 f"results/step4_node_{r['node_id']}_{PARTITION_ATTR}_results.json")
     log.info(f"\n  Summary outputs:")
     log.info(f"    {out1}")
     log.info(f"    {out2}")

@@ -35,6 +35,7 @@ import json
 import shutil
 import logging
 import argparse
+import datetime
 import time
 import numpy as np
 import matplotlib
@@ -60,10 +61,12 @@ with open(args.config, 'r') as f:
 DATASET_NAME   = cfg['dataset']['name']
 SENSITIVE_ATTR = cfg['dataset']['sensitive_attr']
 TARGET_ATTR    = cfg['dataset']['target_attr']
-EXP_NAME       = cfg['experiment']['name']
 NUM_NODES      = cfg['partition']['num_nodes']
 ALPHA          = cfg['partition']['alpha']
 PART_SEED      = cfg['partition']['seed']
+RUN_DATE       = cfg['experiment'].get('run_date') or datetime.date.today().isoformat()
+EXP_NAME       = (cfg['experiment'].get('name')
+                  or f"lenet_alpha{ALPHA}_{NUM_NODES}nodes_seed{PART_SEED}")
 IMAGE_SIZE     = cfg['model']['image_size']
 IN_CHANNELS    = cfg['model']['in_channels']
 NUM_CLASSES    = cfg['model']['num_classes']
@@ -82,10 +85,10 @@ HF_CACHE  = os.environ.get('HF_DATASETS_CACHE',
                             os.path.join(NFS_ROOT, 'hf_cache'))
 os.environ['HF_DATASETS_CACHE'] = HF_CACHE
 
-PLOT_DIR    = os.path.join(EXP_DIR, 'plots')
-RESULTS_DIR = os.path.join(EXP_DIR, 'results')
-CKPT_DIR    = os.path.join(EXP_DIR, 'checkpoints')
-LOG_DIR     = os.path.join(EXP_DIR, 'logs')
+PLOT_DIR    = os.path.join(EXP_DIR, 'plots',       RUN_DATE)
+RESULTS_DIR = os.path.join(EXP_DIR, 'results',     RUN_DATE)
+CKPT_DIR    = os.path.join(EXP_DIR, 'checkpoints', RUN_DATE)
+LOG_DIR     = os.path.join(EXP_DIR, 'logs',        RUN_DATE)
 
 for d in [PLOT_DIR, RESULTS_DIR, LOG_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -95,7 +98,7 @@ shutil.copy(args.config, os.path.join(EXP_DIR, 'config.yaml'))
 NODE_COLORS = ['steelblue', 'salmon', 'mediumseagreen', 'mediumpurple', 'sandybrown']
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-log_path = os.path.join(LOG_DIR, 'step5.log')
+log_path = os.path.join(LOG_DIR, f'step5_{PARTITION_ATTR}.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(message)s',
@@ -217,22 +220,35 @@ def run_single_audit(model, dataset, query_indices, query_gender,
     rel_err = abs_err / true_dp_gap if true_dp_gap > 0 else 0.0
 
     return {
-        'est_p_male'   : est_p_male,
-        'est_p_female' : est_p_female,
-        'est_dp_gap'   : est_dp,
-        'true_dp_gap'  : true_dp_gap,
-        'abs_error'    : abs_err,
-        'rel_error'    : rel_err,
-        'n_queries'    : len(query_indices),
-        'query_pct_male': float(query_gender.mean()),
+        'est_p_male'        : est_p_male,
+        'est_p_female'      : est_p_female,
+        'est_dp_gap'        : est_dp,
+        'true_dp_gap_model_val' : true_dp_gap,   # model DP on val split
+        'abs_error'         : abs_err,           # error vs model_val (primary)
+        'rel_error'         : rel_err,
+        'n_queries'         : len(query_indices),
+        'query_pct_male'    : float(query_gender.mean()),
     }
+
+
+def _add_gt_errors(r, true_dp_data, true_dp_model_full):
+    """Attach data and model-full ground truth errors to an audit result dict."""
+    est = r['est_dp_gap']
+    r['true_dp_gap_data']       = true_dp_data
+    r['abs_error_data']         = abs(est - true_dp_data)
+    r['rel_error_data']         = r['abs_error_data'] / true_dp_data if true_dp_data > 0 else 0.0
+    r['true_dp_gap_model_full'] = true_dp_model_full
+    r['abs_error_model_full']   = abs(est - true_dp_model_full)
+    r['rel_error_model_full']   = (r['abs_error_model_full'] / true_dp_model_full
+                                   if true_dp_model_full > 0 else 0.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker: audits one TARGET node (called in a separate process per GPU)
 # ─────────────────────────────────────────────────────────────────────────────
 def audit_target_node(target_id, gpu_id, dataset, node_indices,
-                      true_dp_gaps, result_queue, cfg, nfs_paths):
+                      true_dp_gaps, true_dp_gaps_data,
+                      result_queue, cfg, nfs_paths):
     """
     Load target model onto gpu_id, then run all three audit modes
     for every auditor against this target.
@@ -246,13 +262,26 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
 
         # Load target model
         ckpt_path = os.path.join(nfs_paths['ckpt_dir'],
-                                 f'node_{target_id}_best.pt')
+                                 f'node_{target_id}_{PARTITION_ATTR}_best.pt')
         model = LeNet5().to(device)
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
         model.eval()
         print(f'{tag} Model loaded from {ckpt_path}', flush=True)
 
-        true_dp = true_dp_gaps[target_id]
+        true_dp      = true_dp_gaps[target_id]       # model DP on val split (from step 4)
+        true_dp_data = true_dp_gaps_data[target_id]  # ground-truth data DP (from step 4)
+
+        # Compute model-full ground truth: run target model on its entire node partition
+        target_all_indices = node_indices[target_id - 1]
+        target_all_gender  = np.array(dataset[cfg['dataset']['sensitive_attr']],
+                                      dtype=np.int64)[target_all_indices]
+        full_preds, _ = get_predictions(model, dataset, target_all_indices, device)
+        _, _, true_dp_model_full = compute_dp_gap(full_preds, target_all_gender)
+
+        print(f'{tag} Ground truths — dp_gap_data={true_dp_data:.4f}  '
+              f'dp_gap_model_val={true_dp:.4f}  '
+              f'dp_gap_model_full={true_dp_model_full:.4f}', flush=True)
+
         N       = len(dataset)
         global_indices = np.arange(N)
         global_gender  = np.array(dataset[cfg['dataset']['sensitive_attr']],
@@ -274,6 +303,7 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
 
             r = run_single_audit(model, dataset, auditor_indices,
                                  auditor_gender, true_dp, device)
+            _add_gt_errors(r, true_dp_data, true_dp_model_full)
             r.update({
                 'mode'       : 'full_local',
                 'auditor_id' : auditor_id,
@@ -282,7 +312,9 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
             full_results.append(r)
             print(f'{tag} Full local  | Auditor {auditor_id} → '
                   f'est_dp={r["est_dp_gap"]:.4f}  '
-                  f'abs_err={r["abs_error"]:.4f}', flush=True)
+                  f'abs_err(model_val)={r["abs_error"]:.4f}  '
+                  f'abs_err(data)={r["abs_error_data"]:.4f}  '
+                  f'abs_err(model_full)={r["abs_error_model_full"]:.4f}', flush=True)
 
         # ── Mode 2: Budgeted audits (all auditors, all budgets, all repeats) ──
         budget_results = []
@@ -309,6 +341,7 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
 
                     r = run_single_audit(model, dataset, sampled_global,
                                          sampled_gender, true_dp, device)
+                    _add_gt_errors(r, true_dp_data, true_dp_model_full)
                     r.update({
                         'mode'       : 'budgeted',
                         'auditor_id' : auditor_id,
@@ -320,28 +353,36 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
                     repeat_results.append(r)
 
                 # Aggregate across repeats
-                est_dps   = [r['est_dp_gap'] for r in repeat_results]
-                abs_errs  = [r['abs_error']  for r in repeat_results]
-                rel_errs  = [r['rel_error']  for r in repeat_results]
+                est_dps        = [r['est_dp_gap']          for r in repeat_results]
+                abs_errs       = [r['abs_error']           for r in repeat_results]
+                rel_errs       = [r['rel_error']           for r in repeat_results]
+                abs_errs_data  = [r['abs_error_data']      for r in repeat_results]
+                abs_errs_full  = [r['abs_error_model_full'] for r in repeat_results]
 
-                mean_dp, ci_lo, ci_hi = bootstrap_ci(est_dps, seed=cfg['audit']['seed'])
-                mean_abs, _, _        = bootstrap_ci(abs_errs, seed=cfg['audit']['seed'])
-                mean_rel, _, _        = bootstrap_ci(rel_errs, seed=cfg['audit']['seed'])
+                mean_dp, ci_lo, ci_hi   = bootstrap_ci(est_dps,       seed=cfg['audit']['seed'])
+                mean_abs, _, _          = bootstrap_ci(abs_errs,       seed=cfg['audit']['seed'])
+                mean_rel, _, _          = bootstrap_ci(rel_errs,       seed=cfg['audit']['seed'])
+                mean_abs_data, _, _     = bootstrap_ci(abs_errs_data,  seed=cfg['audit']['seed'])
+                mean_abs_full, _, _     = bootstrap_ci(abs_errs_full,  seed=cfg['audit']['seed'])
 
                 budget_agg = {
-                    'mode'           : 'budgeted_agg',
-                    'auditor_id'     : auditor_id,
-                    'target_id'      : target_id,
-                    'budget'         : budget,
-                    'actual_budget'  : actual_budget,
-                    'true_dp_gap'    : true_dp,
-                    'mean_est_dp'    : mean_dp,
-                    'std_est_dp'     : float(np.std(est_dps)),
-                    'ci_lower'       : ci_lo,
-                    'ci_upper'       : ci_hi,
-                    'mean_abs_error' : mean_abs,
-                    'mean_rel_error' : mean_rel,
-                    'repeats'        : repeat_results,
+                    'mode'                   : 'budgeted_agg',
+                    'auditor_id'             : auditor_id,
+                    'target_id'              : target_id,
+                    'budget'                 : budget,
+                    'actual_budget'          : actual_budget,
+                    'true_dp_gap_model_val'  : true_dp,
+                    'true_dp_gap_data'       : true_dp_data,
+                    'true_dp_gap_model_full' : true_dp_model_full,
+                    'mean_est_dp'            : mean_dp,
+                    'std_est_dp'             : float(np.std(est_dps)),
+                    'ci_lower'               : ci_lo,
+                    'ci_upper'               : ci_hi,
+                    'mean_abs_error'         : mean_abs,
+                    'mean_rel_error'         : mean_rel,
+                    'mean_abs_error_data'    : mean_abs_data,
+                    'mean_abs_error_model_full': mean_abs_full,
+                    'repeats'                : repeat_results,
                 }
                 budget_results.append(budget_agg)
 
@@ -353,6 +394,7 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
         # ── Mode 3: Global audit (full dataset → this target) ─────────────────
         r_global = run_single_audit(model, dataset, global_indices,
                                     global_gender, true_dp, device)
+        _add_gt_errors(r_global, true_dp_data, true_dp_model_full)
         r_global.update({
             'mode'      : 'global',
             'auditor_id': 'global',
@@ -387,11 +429,11 @@ def plot_full_estimated_vs_true(full_results, plot_dir):
         if not pairs:
             continue
         est  = [r['est_dp_gap']  for r in pairs]
-        true = [r['true_dp_gap'] for r in pairs]
+        true = [r['true_dp_gap_model_val'] for r in pairs]
         ax.scatter(true, est, color=NODE_COLORS[auditor_id-1],
                    label=f'Auditor {auditor_id}', s=100, zorder=3)
 
-    lims = [0, max(r['true_dp_gap'] for r in full_results) * 1.3]
+    lims = [0, max(r['true_dp_gap_model_val'] for r in full_results) * 1.3]
     ax.plot(lims, lims, 'k--', alpha=0.4, label='Perfect estimate')
     ax.set_xlabel('True DP Gap');  ax.set_ylabel('Estimated DP Gap')
     ax.set_title('Full Local Audit\nEstimated vs True DP Gap',
@@ -399,7 +441,7 @@ def plot_full_estimated_vs_true(full_results, plot_dir):
     ax.set_xlim(lims); ax.set_ylim(lims)
     ax.legend(fontsize=8); ax.spines[['top','right']].set_visible(False)
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step5_full_estimated_vs_true.png')
+    out = os.path.join(plot_dir, f'step5_full_estimated_vs_true_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -439,7 +481,7 @@ def plot_full_error_heatmaps(full_results, num_nodes, plot_dir):
         plt.colorbar(im, ax=ax)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step5_full_error_heatmap.png')
+    out = os.path.join(plot_dir, f'step5_full_error_heatmap_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -501,7 +543,7 @@ def plot_budget_sample_efficiency(budget_results, plot_dir):
     ax.spines[['top','right']].set_visible(False)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step5_budget_sample_efficiency.png')
+    out = os.path.join(plot_dir, f'step5_budget_sample_efficiency_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -559,7 +601,7 @@ def plot_budget_error_vs_mismatch(budget_results, node_stats, plot_dir):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step5_budget_error_vs_mismatch.png')
+    out = os.path.join(plot_dir, f'step5_budget_error_vs_mismatch_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -589,7 +631,7 @@ def plot_global_vs_local(full_results, global_results, plot_dir):
 
         # Global estimate
         glob = next(r for r in global_results if r['target_id'] == target_id)
-        true_dp = glob['true_dp_gap']
+        true_dp = glob['true_dp_gap_model_val']
 
         # Plot
         x_local = range(len(local))
@@ -611,7 +653,7 @@ def plot_global_vs_local(full_results, global_results, plot_dir):
 
     axes[0].set_ylabel('Estimated DP Gap')
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step5_global_vs_local.png')
+    out = os.path.join(plot_dir, f'step5_global_vs_local_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -732,7 +774,7 @@ def plot_ranking_accuracy(full_results, budget_results, global_results,
     ax.spines[['top','right']].set_visible(False)
 
     plt.tight_layout()
-    out = os.path.join(plot_dir, 'step5_ranking_accuracy.png')
+    out = os.path.join(plot_dir, f'step5_ranking_accuracy_{PARTITION_ATTR}.png')
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     return out
@@ -747,6 +789,7 @@ def main():
     log.info("=" * 70)
     log.info(f"\n  Config         : {args.config}")
     log.info(f"  Experiment     : {EXP_NAME}")
+    log.info(f"  Run date       : {RUN_DATE}")
     log.info(f"  NFS root       : {NFS_ROOT}")
     log.info(f"  Audit modes    : full_local, budgeted, global")
     log.info(f"  Budget sizes   : {BUDGET_SIZES}")
@@ -776,7 +819,7 @@ def main():
 
     # ── Load partition ─────────────────────────────────────────────────────────
     partition_fname = f'partition_alpha{ALPHA}_seed{PART_SEED}_{PARTITION_ATTR}.json'
-    partition_path  = os.path.join(EXP_DIR, 'partitions', partition_fname)
+    partition_path  = os.path.join(EXP_DIR, 'partitions', RUN_DATE, partition_fname)
     with open(partition_path) as f:
         partition_data = json.load(f)
     node_indices = [np.array(idx, dtype=np.int64)
@@ -784,18 +827,19 @@ def main():
     log.info(f"  ✓ Partition loaded from {partition_path}")
 
     # ── Load true DP gaps from Step 4 results ─────────────────────────────────
-    step4_path = os.path.join(RESULTS_DIR, 'step4_all_nodes_results.json')
+    step4_path = os.path.join(RESULTS_DIR, f'step4_all_nodes_{PARTITION_ATTR}_results.json')
     with open(step4_path) as f:
         step4 = json.load(f)
-    true_dp_gaps = {r['node_id']: r['dp_gap_model'] for r in step4['nodes']}
-    node_stats   = {r['node_id']: r               for r in step4['nodes']}
+    true_dp_gaps      = {r['node_id']: r['dp_gap_model'] for r in step4['nodes']}  # model, val split
+    true_dp_gaps_data = {r['node_id']: r['dp_gap_data']  for r in step4['nodes']}  # data ground truth
+    node_stats        = {r['node_id']: r                 for r in step4['nodes']}
 
     log.info(f"\n  True DP gaps (model) from Step 4:")
     for node_id, dp in true_dp_gaps.items():
         log.info(f"    Node {node_id}: {dp:.4f}")
 
     # ── Load step 3 node stats for mismatch analysis ───────────────────────────
-    step3_path = os.path.join(RESULTS_DIR, 'step3_partition_stats.json')
+    step3_path = os.path.join(RESULTS_DIR, f'step3_{ALPHA}_{PARTITION_ATTR}_partition_stats.json')
     with open(step3_path) as f:
         step3 = json.load(f)
     node_partition_stats = step3['nodes']   # list, index 0 = Node 1
@@ -822,7 +866,7 @@ def main():
         p = mp.Process(
             target=audit_target_node,
             args=(target_id, gpu_id, dataset, node_indices,
-                  true_dp_gaps, result_queue, cfg, nfs_paths),
+                  true_dp_gaps, true_dp_gaps_data, result_queue, cfg, nfs_paths),
             name=f'Target-{target_id}'
         )
         p.start()
@@ -881,7 +925,7 @@ def main():
     log.info("  " + "-" * 58)
     for r in sorted(full_results, key=lambda x: (x['auditor_id'], x['target_id'])):
         log.info(f"  Node {r['auditor_id']:>2}    → Node {r['target_id']:<5}"
-                 f" {r['est_dp_gap']:>8.4f} {r['true_dp_gap']:>8.4f}"
+                 f" {r['est_dp_gap']:>8.4f} {r['true_dp_gap_model_val']:>8.4f}"
                  f" {r['abs_error']:>9.4f} {r['rel_error']:>8.1%}")
 
     log.info(f"\n  Overall — abs error: {abs_errs.mean():.4f} ± {abs_errs.std():.4f}"
@@ -893,7 +937,7 @@ def main():
     for r in sorted(global_results, key=lambda x: x['target_id']):
         log.info(f"  Global → Node {r['target_id']}  "
                  f"est_dp={r['est_dp_gap']:.4f}  "
-                 f"true_dp={r['true_dp_gap']:.4f}  "
+                 f"true_dp={r['true_dp_gap_model_val']:.4f}  "
                  f"abs_err={r['abs_error']:.4f}  "
                  f"rel_err={r['rel_error']:.1%}")
 
@@ -923,25 +967,34 @@ def main():
     log.info(f"  ✓ {out}")
 
     # ── Save results JSON ──────────────────────────────────────────────────────
+    abs_errs_data = np.array([r['abs_error_data']        for r in full_results])
+    abs_errs_full = np.array([r['abs_error_model_full']  for r in full_results])
+
     results = {
-        'experiment'      : EXP_NAME,
-        'alpha'           : ALPHA,
-        'num_nodes'       : NUM_NODES,
-        'budget_sizes'    : BUDGET_SIZES,
-        'num_repeats'     : NUM_REPEATS,
-        'total_time_s'    : total_time,
-        'true_dp_gaps'    : true_dp_gaps,
-        'full_results'    : full_results,
-        'budget_results'  : budget_results,
-        'global_results'  : global_results,
+        'experiment'           : EXP_NAME,
+        'partition_attr'       : PARTITION_ATTR,
+        'alpha'                : ALPHA,
+        'num_nodes'            : NUM_NODES,
+        'budget_sizes'         : BUDGET_SIZES,
+        'num_repeats'          : NUM_REPEATS,
+        'total_time_s'         : total_time,
+        'true_dp_gaps_model_val'  : true_dp_gaps,
+        'true_dp_gaps_data'    : true_dp_gaps_data,
+        'full_results'         : full_results,
+        'budget_results'       : budget_results,
+        'global_results'       : global_results,
         'summary': {
-            'full_mean_abs_error': float(abs_errs.mean()),
-            'full_std_abs_error' : float(abs_errs.std()),
-            'full_mean_rel_error': float(rel_errs.mean()),
-            'full_std_rel_error' : float(rel_errs.std()),
+            'full_mean_abs_error_model_val' : float(abs_errs.mean()),
+            'full_std_abs_error_model_val'  : float(abs_errs.std()),
+            'full_mean_rel_error_model_val' : float(rel_errs.mean()),
+            'full_std_rel_error_model_val'  : float(rel_errs.std()),
+            'full_mean_abs_error_data'      : float(abs_errs_data.mean()),
+            'full_std_abs_error_data'       : float(abs_errs_data.std()),
+            'full_mean_abs_error_model_full': float(abs_errs_full.mean()),
+            'full_std_abs_error_model_full' : float(abs_errs_full.std()),
         }
     }
-    results_path = os.path.join(RESULTS_DIR, 'step5_audit_results.json')
+    results_path = os.path.join(RESULTS_DIR, f'step5_audit_results_{PARTITION_ATTR}.json')
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     log.info(f"\n  ✓ Results saved → {results_path}")
@@ -952,17 +1005,19 @@ def main():
     log.info(f"{'='*70}")
     log.info(f"\n  Total audits run   : {total_audits:,}")
     log.info(f"  Total time         : {total_time:.0f}s ({total_time/60:.1f} min)")
-    log.info(f"  Full local abs err : {abs_errs.mean():.4f} ± {abs_errs.std():.4f}")
-    log.info(f"  Full local rel err : {rel_errs.mean():.1%} ± {rel_errs.std():.1%}")
+    log.info(f"  Full local abs err (model_val)  : {abs_errs.mean():.4f} ± {abs_errs.std():.4f}")
+    log.info(f"  Full local abs err (data)       : {abs_errs_data.mean():.4f} ± {abs_errs_data.std():.4f}")
+    log.info(f"  Full local abs err (model_full) : {abs_errs_full.mean():.4f} ± {abs_errs_full.std():.4f}")
+    log.info(f"  Full local rel err (model_val)  : {rel_errs.mean():.1%} ± {rel_errs.std():.1%}")
     log.info(f"\n  Outputs saved to: {EXP_DIR}")
-    log.info(f"    plots/step5_full_estimated_vs_true.png")
-    log.info(f"    plots/step5_full_error_heatmap.png")
-    log.info(f"    plots/step5_budget_sample_efficiency.png")
-    log.info(f"    plots/step5_budget_error_vs_mismatch.png")
-    log.info(f"    plots/step5_global_vs_local.png")
-    log.info(f"    plots/step5_ranking_accuracy.png")
-    log.info(f"    results/step5_audit_results.json")
-    log.info(f"    logs/step5.log")
+    log.info(f"    plots/step5_full_estimated_vs_true_{PARTITION_ATTR}.png")
+    log.info(f"    plots/step5_full_error_heatmap_{PARTITION_ATTR}.png")
+    log.info(f"    plots/step5_budget_sample_efficiency_{PARTITION_ATTR}.png")
+    log.info(f"    plots/step5_budget_error_vs_mismatch_{PARTITION_ATTR}.png")
+    log.info(f"    plots/step5_global_vs_local_{PARTITION_ATTR}.png")
+    log.info(f"    plots/step5_ranking_accuracy_{PARTITION_ATTR}.png")
+    log.info(f"    results/step5_audit_results_{PARTITION_ATTR}.json")
+    log.info(f"    logs/step5_{PARTITION_ATTR}.log")
     log.info(f"{'='*70}")
 
 
