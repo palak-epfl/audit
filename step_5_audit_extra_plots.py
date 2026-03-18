@@ -92,7 +92,11 @@ auditor_ids         = sorted(set(r['auditor_id'] for r in full_results))
 all_true_dp_gaps = {
     'data'       : {int(k): v for k, v in data['true_dp_gaps_data'].items()},
     'model_val'  : {int(k): v for k, v in data['true_dp_gaps_model_val'].items()},
-    'model_full' : {int(k): v for k, v in data['true_dp_gaps_model_full'].items()},
+    'model_full' : (
+        {int(k): v for k, v in data['true_dp_gaps_model_full'].items()}
+        if 'true_dp_gaps_model_full' in data else
+        {r['target_id']: r['true_dp_gap_model_full'] for r in global_all_results}
+    ),
 }
 # Primary (model_val) — used in helpers that need a single true_dp_gaps dict
 true_dp_gaps = all_true_dp_gaps['model_val']
