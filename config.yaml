@@ -1,6 +1,7 @@
 experiment:
     name: "lenet_alpha0.5_5nodes_seed42"
     notes: "Single LeNet baseline, full CelebA, gender sensitive attr"
+    run_date: null   # set to "YYYY-MM-DD" to pin a date; null = today's date at runtime
 
 # ── NFS paths ─────────────────────────────────────────────────
 # Set NFS_ROOT env var to override, e.g.:

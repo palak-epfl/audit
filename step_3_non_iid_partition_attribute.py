@@ -35,6 +35,7 @@ import json
 import shutil
 import logging
 import argparse
+import datetime
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -57,6 +58,7 @@ DATASET_NAME   = cfg['dataset']['name']
 SENSITIVE_ATTR = cfg['dataset']['sensitive_attr']
 TARGET_ATTR    = cfg['dataset']['target_attr']
 EXP_NAME       = cfg['experiment']['name']
+RUN_DATE       = cfg['experiment'].get('run_date') or datetime.date.today().isoformat()
 NUM_NODES      = cfg['partition']['num_nodes']
 ALPHA          = cfg['partition']['alpha']
 MIN_SAMPLES    = cfg['partition']['min_samples']
@@ -76,10 +78,10 @@ HF_CACHE  = os.environ.get('HF_DATASETS_CACHE',
                             os.path.join(NFS_ROOT, 'hf_cache'))
 os.environ['HF_DATASETS_CACHE'] = HF_CACHE
 
-PLOT_DIR      = os.path.join(EXP_DIR, 'plots')
-RESULTS_DIR   = os.path.join(EXP_DIR, 'results')
-PARTITION_DIR = os.path.join(EXP_DIR, 'partitions')
-LOG_DIR       = os.path.join(EXP_DIR, 'logs')
+PLOT_DIR      = os.path.join(EXP_DIR, 'plots',      RUN_DATE)
+RESULTS_DIR   = os.path.join(EXP_DIR, 'results',    RUN_DATE)
+PARTITION_DIR = os.path.join(EXP_DIR, 'partitions', RUN_DATE)
+LOG_DIR       = os.path.join(EXP_DIR, 'logs',       RUN_DATE)
 
 for d in [HF_CACHE, PLOT_DIR, RESULTS_DIR, PARTITION_DIR, LOG_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -126,6 +128,7 @@ log.info("  Step 3: Non-IID Partition + Visualisation")
 log.info("=" * 70)
 log.info(f"\n  Config          : {args.config}")
 log.info(f"  Experiment      : {EXP_NAME}")
+log.info(f"  Run date        : {RUN_DATE}")
 log.info(f"  NFS root        : {NFS_ROOT}")
 log.info(f"  Num nodes       : {NUM_NODES}")
 log.info(f"  Dirichlet α     : {ALPHA}")
