@@ -77,6 +77,44 @@ GT_FIELDS = {
 }
 
 
+def save_heatmap_two_gts(abs_mv, rel_mv, abs_data, rel_data,
+                         row_labels, col_labels, title, out_path):
+    """4-panel heatmap: model_val abs | model_val rel | data abs | data rel."""
+    n_rows, n_cols = abs_mv.shape
+    cell_w = max(1.1, 5 / n_cols)
+    fig_w  = cell_w * n_cols * 4 + 3
+    fig_h  = max(3, n_rows * 0.65)
+    fig, axes = plt.subplots(1, 4, figsize=(fig_w, fig_h))
+    fig.suptitle(title, fontsize=11, fontweight='bold')
+
+    panels = [
+        (axes[0], abs_mv,   'Abs Error — Model/Val', '{:.3f}', 'Abs Error'),
+        (axes[1], rel_mv,   'Rel Error — Model/Val', '{:.0%}',  'Rel Error'),
+        (axes[2], abs_data, 'Abs Error — Data',      '{:.3f}', 'Abs Error'),
+        (axes[3], rel_data, 'Rel Error — Data',      '{:.0%}',  'Rel Error'),
+    ]
+    for ax, mat, panel_title, fmt, cbar_label in panels:
+        im = ax.imshow(mat, cmap='YlOrRd', aspect='auto', vmin=0)
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels([f'Target {c}' for c in col_labels], fontsize=9)
+        ax.set_yticks(range(n_rows))
+        ax.set_yticklabels(row_labels, fontsize=9)
+        ax.set_xlabel('Target Node')
+        ax.set_ylabel('Auditor / Coalition')
+        ax.set_title(panel_title)
+        for i in range(n_rows):
+            for j in range(n_cols):
+                val = mat[i, j]
+                txt = fmt.format(val) if not np.isnan(val) else '—'
+                ax.text(j, i, txt, ha='center', va='center', fontsize=8)
+        plt.colorbar(im, ax=ax, label=cbar_label)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved → {out_path}")
+
+
 def save_heatmap(abs_mat, rel_mat, row_labels, col_labels, title, out_path):
     n_rows, n_cols = abs_mat.shape
     cell_w = max(1.1, 5 / n_cols)
@@ -231,3 +269,23 @@ for gt_key, (abs_field_full, abs_field_collab,
         f'All Auditors Combined: Single | Pairs | Triples | Global  ({gt_label})',
         os.path.join(PLOT_DIR, f'step5_heatmap_combined_{PARTITION_ATTR}_{gt_key}.png')
     )
+
+# ── 4-panel comparison: model_val vs data GT, for each mode ───────────────
+def _build_full_local_mats(err_field_abs, err_field_rel):
+    auditor_ids = sorted(set(r['auditor_id'] for r in full_results))
+    abs_mat = np.full((len(auditor_ids), len(target_ids)), np.nan)
+    rel_mat = np.full((len(auditor_ids), len(target_ids)), np.nan)
+    for r in full_results:
+        i = auditor_ids.index(r['auditor_id'])
+        j = target_ids.index(r['target_id'])
+        abs_mat[i, j] = r.get(err_field_abs, np.nan)
+        rel_mat[i, j] = r.get(err_field_rel, np.nan)
+    return abs_mat, rel_mat, [f'Node {a}' for a in auditor_ids]
+
+abs_mv, rel_mv, row_labels = _build_full_local_mats('abs_error',      'rel_error')
+abs_dt, rel_dt, _          = _build_full_local_mats('abs_error_data', 'rel_error_data')
+save_heatmap_two_gts(
+    abs_mv, rel_mv, abs_dt, rel_dt, row_labels, target_ids,
+    f'Full Local Audit — Model/Val GT vs Data GT',
+    os.path.join(PLOT_DIR, f'step5_heatmap_full_local_gt_comparison_{PARTITION_ATTR}.png')
+)
