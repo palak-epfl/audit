@@ -1,6 +1,8 @@
 """
-Regenerate step3_stacked_groups.png with a neutral color scheme.
-Replaces pink/magenta for non-male with orange tones.
+Regenerate step3 group composition plots with a neutral color scheme.
+Replaces pink/magenta for non-male with orange tones. Produces two plots:
+  step3_stacked_groups.png  — stacked proportions (original layout)
+  step3_grouped_counts.png  — 4 side-by-side bars per node, absolute counts
 
 Usage:
     python3 regen_stacked_groups.py --config config.yaml
@@ -76,18 +78,25 @@ group_labels_list = [
     f'{sens_neg_label} + Not {TARGET_ATTR}',
 ]
 
-bottoms    = np.zeros(len(all_labels))
-group_data = {g: [] for g in group_labels_list}
+# ── Compute proportions and absolute counts ───────────────────────────────
+group_props = {g: [] for g in group_labels_list}
+group_counts = {g: [] for g in group_labels_list}
 for idx in all_indices:
     g = gender[idx]; s = smiling[idx]; n = len(idx)
-    group_data[f'{sens_pos_label} + {TARGET_ATTR}'].append(     ((g==1)&(s==1)).sum() / n)
-    group_data[f'{sens_pos_label} + Not {TARGET_ATTR}'].append( ((g==1)&(s==0)).sum() / n)
-    group_data[f'{sens_neg_label} + {TARGET_ATTR}'].append(     ((g==0)&(s==1)).sum() / n)
-    group_data[f'{sens_neg_label} + Not {TARGET_ATTR}'].append( ((g==0)&(s==0)).sum() / n)
+    group_props[f'{sens_pos_label} + {TARGET_ATTR}'].append(     ((g==1)&(s==1)).sum() / n)
+    group_props[f'{sens_pos_label} + Not {TARGET_ATTR}'].append( ((g==1)&(s==0)).sum() / n)
+    group_props[f'{sens_neg_label} + {TARGET_ATTR}'].append(     ((g==0)&(s==1)).sum() / n)
+    group_props[f'{sens_neg_label} + Not {TARGET_ATTR}'].append( ((g==0)&(s==0)).sum() / n)
+    group_counts[f'{sens_pos_label} + {TARGET_ATTR}'].append(     int(((g==1)&(s==1)).sum()))
+    group_counts[f'{sens_pos_label} + Not {TARGET_ATTR}'].append( int(((g==1)&(s==0)).sum()))
+    group_counts[f'{sens_neg_label} + {TARGET_ATTR}'].append(     int(((g==0)&(s==1)).sum()))
+    group_counts[f'{sens_neg_label} + Not {TARGET_ATTR}'].append( int(((g==0)&(s==0)).sum()))
 
+# ── Plot 1: Stacked proportions (original, new color scheme) ──────────────
+bottoms = np.zeros(len(all_labels))
 fig, ax = plt.subplots(figsize=(10, 5))
 for gname, color in zip(group_labels_list, group_colors):
-    vals = group_data[gname]
+    vals = group_props[gname]
     ax.bar(all_labels, vals, bottom=bottoms,
            label=gname, color=color, edgecolor='white', linewidth=0.8)
     bottoms += np.array(vals)
@@ -108,6 +117,39 @@ for j, idx in enumerate(all_indices):
 
 plt.tight_layout()
 out = os.path.join(PLOT_DIR, 'step3_stacked_groups.png')
+plt.savefig(out, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"Saved → {out}")
+
+# ── Plot 2: Grouped bars — absolute counts, 4 bars per node ───────────────
+n_nodes   = len(all_labels)
+n_groups  = len(group_labels_list)
+bar_width = 0.18
+x         = np.arange(n_nodes)
+
+fig, ax = plt.subplots(figsize=(12, 5))
+for i, (gname, color) in enumerate(zip(group_labels_list, group_colors)):
+    counts   = group_counts[gname]
+    offsets  = x + (i - (n_groups - 1) / 2) * bar_width
+    bars     = ax.bar(offsets, counts, width=bar_width,
+                      label=gname, color=color, edgecolor='white', linewidth=0.6)
+    for bar, val in zip(bars, counts):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(counts) * 0.01,
+                f'{val:,}', ha='center', va='bottom', fontsize=6, rotation=90)
+
+ax.set_title(
+    f'{SENSITIVE_ATTR} × {TARGET_ATTR} Absolute Counts per Node  (α={ALPHA})\n'
+    f'Non-IID split driven by {PARTITION_ATTR}',
+    fontsize=11, fontweight='bold')
+ax.set_ylabel('Number of samples')
+ax.set_xticks(x)
+ax.set_xticklabels(all_labels)
+ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=9)
+ax.spines[['top', 'right']].set_visible(False)
+
+plt.tight_layout()
+out = os.path.join(PLOT_DIR, 'step3_grouped_counts.png')
 plt.savefig(out, dpi=150, bbox_inches='tight')
 plt.close()
 print(f"Saved → {out}")
