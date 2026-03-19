@@ -44,7 +44,11 @@ with open(args.config, 'r') as f:
 DATASET_NAME   = cfg['dataset']['name']
 SENSITIVE_ATTR = cfg['dataset']['sensitive_attr']   # 'Male'
 TARGET_ATTR    = cfg['dataset']['target_attr']       # 'Smiling'
-EXP_NAME       = cfg['experiment']['name']
+ALPHA          = cfg['partition']['alpha']
+NUM_NODES      = cfg['partition']['num_nodes']
+PART_SEED      = cfg['partition']['seed']
+EXP_NAME       = (cfg['experiment'].get('name')
+                  or f"lenet_alpha{ALPHA}_{NUM_NODES}nodes_seed{PART_SEED}")
 EXP_NOTES      = cfg['experiment']['notes']
 
 # ── NFS paths ──────────────────────────────────────────────────────────────────
