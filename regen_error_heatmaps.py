@@ -178,33 +178,30 @@ for gt_key, (abs_field_full, abs_field_collab,
             os.path.join(PLOT_DIR, f'step5_heatmap_collab_triples_{PARTITION_ATTR}_{gt_key}.png')
         )
 
-    # ── Combined: single + pairs + triples in one heatmap ─────────────────
-    # Rows: single auditors, then pair coalitions, then triple coalitions
-    # Divider rows (NaN) inserted between groups for visual separation
-    auditor_ids      = sorted(set(r['auditor_id'] for r in full_results))
-    pair_labels      = sorted(set(r['auditor_id'] for r in collab_pair_results))   if collab_pair_results   else []
-    triple_labels    = sorted(set(r['auditor_id'] for r in collab_triple_results)) if collab_triple_results else []
+    # ── Combined: single + pairs + triples + global in one heatmap ───────
+    auditor_ids   = sorted(set(r['auditor_id'] for r in full_results))
+    pair_labels   = sorted(set(r['auditor_id'] for r in collab_pair_results))   if collab_pair_results   else []
+    triple_labels = sorted(set(r['auditor_id'] for r in collab_triple_results)) if collab_triple_results else []
 
-    # Build row label list with blank separator rows between groups
     row_labels_combined = (
         [f'N{a} (single)' for a in auditor_ids]
-        + (['─── pairs ───'] if pair_labels   else [])
+        + (['─── pairs ───']   if pair_labels   else [])
         + pair_labels
-        + (['─ triples ───'] if triple_labels else [])
+        + (['─ triples ───']   if triple_labels else [])
         + triple_labels
+        + ['── global ───', 'Global all', 'Global excl']
     )
     n_rows = len(row_labels_combined)
     abs_combined = np.full((n_rows, len(target_ids)), np.nan)
     rel_combined = np.full((n_rows, len(target_ids)), np.nan)
 
-    # Fill single rows
+    single_labels_full = [f'N{a} (single)' for a in auditor_ids]
     for r in full_results:
-        i = [f'N{a} (single)' for a in auditor_ids].index(f'N{r["auditor_id"]} (single)')
+        i = single_labels_full.index(f'N{r["auditor_id"]} (single)')
         j = target_ids.index(r['target_id'])
         abs_combined[i, j] = r.get(abs_field_full, np.nan)
         rel_combined[i, j] = r.get(rel_field_full, np.nan)
 
-    # Fill pair rows (offset past singles + 1 separator)
     pair_offset = len(auditor_ids) + (1 if pair_labels else 0)
     for r in collab_pair_results:
         i = pair_offset + pair_labels.index(r['auditor_id'])
@@ -212,16 +209,25 @@ for gt_key, (abs_field_full, abs_field_collab,
         abs_combined[i, j] = r.get(abs_field_collab, np.nan)
         rel_combined[i, j] = r.get(rel_field_collab, np.nan)
 
-    # Fill triple rows (offset past singles + pairs + 2 separators)
-    triple_offset = len(auditor_ids) + (1 if pair_labels else 0) + len(pair_labels) + (1 if triple_labels else 0)
+    triple_offset = pair_offset + len(pair_labels) + (1 if triple_labels else 0)
     for r in collab_triple_results:
         i = triple_offset + triple_labels.index(r['auditor_id'])
         j = target_ids.index(r['target_id'])
         abs_combined[i, j] = r.get(abs_field_collab, np.nan)
         rel_combined[i, j] = r.get(rel_field_collab, np.nan)
 
+    global_offset = triple_offset + len(triple_labels) + 1  # +1 for separator row
+    for r in global_all_results:
+        j = target_ids.index(r['target_id'])
+        abs_combined[global_offset + 0, j] = r.get(abs_field_full, np.nan)
+        rel_combined[global_offset + 0, j] = r.get(rel_field_full, np.nan)
+    for r in global_excl_results:
+        j = target_ids.index(r['target_id'])
+        abs_combined[global_offset + 1, j] = r.get(abs_field_full, np.nan)
+        rel_combined[global_offset + 1, j] = r.get(rel_field_full, np.nan)
+
     save_heatmap(
         abs_combined, rel_combined, row_labels_combined, target_ids,
-        f'All Auditors Combined: Single | Pairs | Triples  ({gt_label})',
+        f'All Auditors Combined: Single | Pairs | Triples | Global  ({gt_label})',
         os.path.join(PLOT_DIR, f'step5_heatmap_combined_{PARTITION_ATTR}_{gt_key}.png')
     )
