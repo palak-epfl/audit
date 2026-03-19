@@ -96,64 +96,71 @@ print(f"PC1 explains {var[0]:.1%} variance")
 if len(var) > 1:
     print(f"PC2 explains {var[1]:.1%} variance")
 
-# ── Plot ──────────────────────────────────────────────────────────────────
+# ── Plot 1: Node scatter in PC space ──────────────────────────────────────
 top_n = min(args.top_n, len(attr_names))
 
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig, ax = plt.subplots(figsize=(7, 6))
 fig.suptitle(f'Node Distribution Space — PCA over all {len(attr_names)} CelebA attributes\n'
              f'Each point = one node (mean attribute prevalence as feature vector)',
-             fontsize=12, fontweight='bold')
-
-# Panel 1: scatter
-ax = axes[0]
+             fontsize=11, fontweight='bold')
 for i in range(NUM_NODES):
     x = coords[i, 0]
     y = coords[i, 1] if coords.shape[1] > 1 else 0.0
     ax.scatter(x, y, color=NODE_COLORS[i], s=250, zorder=3)
     ax.annotate(f'Node {i+1}', xy=(x, y),
-                xytext=(6, 4), textcoords='offset points', fontsize=9)
+                xytext=(6, 4), textcoords='offset points', fontsize=10)
 ax.set_xlabel(f'PC1  ({var[0]:.1%} var)')
 ax.set_ylabel(f'PC2  ({var[1]:.1%} var)' if len(var) > 1 else 'PC2  (0.0% var)')
-ax.set_title('Node positions in PC space')
 ax.axhline(0, color='gray', linewidth=0.5, linestyle='--')
 ax.axvline(0, color='gray', linewidth=0.5, linestyle='--')
 ax.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+out = os.path.join(PLOT_DIR, f'step5b_node_pca_scatter_{PARTITION_ATTR}.png')
+plt.savefig(out, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"Saved → {out}")
 
-# Panel 2: top-N loadings for PC1
-ax = axes[1]
+# ── Plot 2: PC1 loadings ───────────────────────────────────────────────────
 order1  = np.argsort(np.abs(loadings[0]))[::-1][:top_n]
 names1  = [attr_names[i] for i in order1]
 vals1   = loadings[0][order1]
 colors1 = ['steelblue' if v >= 0 else 'tomato' for v in vals1]
+
+fig, ax = plt.subplots(figsize=(7, 6))
 ax.barh(range(top_n), vals1[::-1], color=colors1[::-1])
 ax.set_yticks(range(top_n))
-ax.set_yticklabels(names1[::-1], fontsize=8)
+ax.set_yticklabels(names1[::-1], fontsize=9)
 ax.axvline(0, color='black', linewidth=0.8)
 ax.set_xlabel('Loading')
-ax.set_title(f'PC1 ({var[0]:.1%}) — top {top_n} features\n'
-             f'blue = positive, red = negative')
+ax.set_title(f'PC1 ({var[0]:.1%} variance) — top {top_n} feature loadings\n'
+             f'blue = positive, red = negative',
+             fontsize=11, fontweight='bold')
 ax.spines[['top', 'right']].set_visible(False)
+plt.tight_layout()
+out = os.path.join(PLOT_DIR, f'step5b_node_pca_pc1_loadings_{PARTITION_ATTR}.png')
+plt.savefig(out, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"Saved → {out}")
 
-# Panel 3: top-N loadings for PC2
-ax = axes[2]
+# ── Plot 3: PC2 loadings ───────────────────────────────────────────────────
 if len(var) > 1:
     order2  = np.argsort(np.abs(loadings[1]))[::-1][:top_n]
     names2  = [attr_names[i] for i in order2]
     vals2   = loadings[1][order2]
     colors2 = ['steelblue' if v >= 0 else 'tomato' for v in vals2]
+
+    fig, ax = plt.subplots(figsize=(7, 6))
     ax.barh(range(top_n), vals2[::-1], color=colors2[::-1])
     ax.set_yticks(range(top_n))
-    ax.set_yticklabels(names2[::-1], fontsize=8)
+    ax.set_yticklabels(names2[::-1], fontsize=9)
     ax.axvline(0, color='black', linewidth=0.8)
     ax.set_xlabel('Loading')
-    ax.set_title(f'PC2 ({var[1]:.1%}) — top {top_n} features\n'
-                 f'blue = positive, red = negative')
-else:
-    ax.set_visible(False)
-ax.spines[['top', 'right']].set_visible(False)
-
-plt.tight_layout()
-out = os.path.join(PLOT_DIR, f'step5b_node_pca_40attr_{PARTITION_ATTR}.png')
-plt.savefig(out, dpi=150, bbox_inches='tight')
-plt.close()
-print(f"Saved → {out}")
+    ax.set_title(f'PC2 ({var[1]:.1%} variance) — top {top_n} feature loadings\n'
+                 f'blue = positive, red = negative',
+                 fontsize=11, fontweight='bold')
+    ax.spines[['top', 'right']].set_visible(False)
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_node_pca_pc2_loadings_{PARTITION_ATTR}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved → {out}")
