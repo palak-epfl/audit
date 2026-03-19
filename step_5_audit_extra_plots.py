@@ -366,6 +366,73 @@ for gt_name, gt_label in [
 
 
     # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 2b: Per-auditee budget BAR chart — mean abs error per auditor at each
+    #          budget level, values written on top of bars for easy reading.
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 2b: Per-auditee budget bar chart...")
+
+    ncols_b = min(3, len(target_ids))
+    nrows_b = (len(target_ids) + ncols_b - 1) // ncols_b
+    fig, axes = plt.subplots(nrows_b, ncols_b,
+                              figsize=(6 * ncols_b, 4 * nrows_b),
+                              squeeze=False)
+    fig.suptitle('Per-Auditee Budget — Mean Abs Error per Auditor at Each Budget\n'
+                 '(values labelled on bars)',
+                 fontsize=13, fontweight='bold')
+
+    for idx, tgt_id in enumerate(target_ids):
+        ax = axes[idx // ncols_b][idx % ncols_b]
+        aud_ids_here = [a for a in auditor_ids if a != tgt_id]
+        n_auds    = len(aud_ids_here)
+        n_bud     = len(budget_sizes)
+        bar_w     = 0.8 / n_auds
+        x_centers = np.arange(n_bud)
+
+        for a_idx, aud_id in enumerate(aud_ids_here):
+            offset = (a_idx - n_auds / 2 + 0.5) * bar_w
+            color  = NODE_COLORS[aud_id - 1]
+            for b_idx, budget in enumerate(budget_sizes):
+                rows = [r for r in budget_results
+                        if r['auditor_id'] == aud_id and r['target_id'] == tgt_id
+                        and r['budget'] == budget]
+                if not rows:
+                    continue
+                val = rows[0]['mean_abs_error']
+                x   = x_centers[b_idx] + offset
+                ax.bar(x, val, bar_w * 0.9, color=color, edgecolor='white',
+                       linewidth=0.5,
+                       label=f'N{aud_id}' if b_idx == 0 else '')
+                ax.text(x, val + 0.002, f'{val:.3f}', ha='center', va='bottom',
+                        fontsize=5, color=color, rotation=90)
+
+        glob_all  = get_global_all(tgt_id)
+        glob_excl = get_global_excl(tgt_id)
+        if glob_all:
+            ax.axhline(glob_all['abs_error'], color='red', linestyle='-.', linewidth=1.2,
+                       label=f'Global all ({glob_all["abs_error"]:.3f})')
+        if glob_excl:
+            ax.axhline(glob_excl['abs_error'], color='orange', linestyle=':', linewidth=1.2,
+                       label=f'Global excl ({glob_excl["abs_error"]:.3f})')
+
+        ax.set_xticks(x_centers)
+        ax.set_xticklabels([str(b) for b in budget_sizes], fontsize=8)
+        ax.set_xlabel('Query Budget')
+        ax.set_ylabel('Mean Absolute Error')
+        ax.set_title(f'Target: Node {tgt_id}', fontweight='bold')
+        ax.legend(fontsize=7)
+        ax.spines[['top','right']].set_visible(False)
+
+    for idx in range(len(target_ids), nrows_b * ncols_b):
+        axes[idx // ncols_b][idx % ncols_b].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_per_auditee_budget_bars_{PARTITION_ATTR}_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
     # Plot 3: Confidence intervals per (auditor, target) pair per budget
     # ─────────────────────────────────────────────────────────────────────────────
     log.info(f"  [{gt_label}] Generating Plot 3: Confidence interval plot...")
@@ -639,6 +706,79 @@ for gt_name, gt_label in [
 
 
     # ─────────────────────────────────────────────────────────────────────────────
+    # Plot 5b: Combined all modes BAR chart — estimated DP gap for full-local,
+    #          global-all and global-excl per target, values on top of bars.
+    # ─────────────────────────────────────────────────────────────────────────────
+    log.info(f"  [{gt_label}] Generating Plot 5b: Combined all modes bar chart...")
+
+    ncols_b = min(3, len(target_ids))
+    nrows_b = (len(target_ids) + ncols_b - 1) // ncols_b
+    fig, axes = plt.subplots(nrows_b, ncols_b,
+                              figsize=(7 * ncols_b, 5 * nrows_b),
+                              squeeze=False)
+    fig.suptitle('All Audit Modes — Estimated DP Gap (Bar Chart)\n'
+                 'Full Local | Global All | Global Excl — values on bars',
+                 fontsize=13, fontweight='bold')
+
+    for idx, tgt_id in enumerate(target_ids):
+        ax      = axes[idx // ncols_b][idx % ncols_b]
+        true_dp = true_dp_gaps[tgt_id]
+
+        bar_labels = []
+        bar_vals   = []
+        bar_cols   = []
+
+        for aud_id in auditor_ids:
+            if aud_id == tgt_id:
+                continue
+            full = get_full(aud_id, tgt_id)
+            if full:
+                bar_labels.append(f'N{aud_id}\nfull')
+                bar_vals.append(full['est_dp_gap'])
+                bar_cols.append(NODE_COLORS[aud_id - 1])
+
+        glob_all  = get_global_all(tgt_id)
+        glob_excl = get_global_excl(tgt_id)
+        if glob_all:
+            bar_labels.append('Global\nall')
+            bar_vals.append(glob_all['est_dp_gap'])
+            bar_cols.append('red')
+        if glob_excl:
+            bar_labels.append('Global\nexcl')
+            bar_vals.append(glob_excl['est_dp_gap'])
+            bar_cols.append('orange')
+
+        x_pos = np.arange(len(bar_labels))
+        rects = ax.bar(x_pos, bar_vals, color=bar_cols, edgecolor='white',
+                       linewidth=0.8, width=0.7, zorder=3)
+
+        for rect, val in zip(rects, bar_vals):
+            ax.text(rect.get_x() + rect.get_width() / 2,
+                    rect.get_height() + 0.003, f'{val:.3f}',
+                    ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+        ax.axhline(true_dp, color='black', linestyle='--', linewidth=1.5,
+                   label=f'True DP ({true_dp:.3f})', zorder=2)
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(bar_labels, fontsize=8)
+        ax.set_ylabel('Estimated DP Gap')
+        ax.set_ylim(0, max(bar_vals + [true_dp]) * 1.25)
+        ax.set_title(f'Target: Node {tgt_id}', fontweight='bold')
+        ax.legend(fontsize=8)
+        ax.spines[['top','right']].set_visible(False)
+
+    for idx in range(len(target_ids), nrows_b * ncols_b):
+        axes[idx // ncols_b][idx % ncols_b].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_combined_all_modes_bars_{PARTITION_ATTR}_{gt_name}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+
+    # ─────────────────────────────────────────────────────────────────────────────
     # Plot 6: Per-auditor consistency box plots
     # For each auditor: distribution of absolute errors across all targets
     # and all budget sizes. Shows which auditor is most/least consistent.
@@ -726,8 +866,9 @@ log.info(f"\n  All plots saved to: {PLOT_DIR}")
 log.info(f"  Each plot generated 3x — one per ground truth definition:")
 for gt_name, gt_label in [('data','Data Labels'), ('model_val','Model Val'), ('model_full','Model Full')]:
     log.info(f"\n  [{gt_label}]")
-    for name in ['budget_labelled', 'per_auditee_budget', 'confidence_intervals',
-                 'bias_variance', 'combined_all_modes', 'auditor_consistency']:
+    for name in ['budget_labelled', 'per_auditee_budget', 'per_auditee_budget_bars',
+                 'confidence_intervals', 'bias_variance',
+                 'combined_all_modes', 'combined_all_modes_bars', 'auditor_consistency']:
         log.info(f"    step5b_{name}_{PARTITION_ATTR}_{gt_name}.png")
 log.info(f"\n  logs/step5b_{PARTITION_ATTR}.log")
 log.info(f"{'='*70}")
