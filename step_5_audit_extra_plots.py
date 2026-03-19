@@ -29,6 +29,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 from scipy import stats as scipy_stats
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 import yaml
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -897,6 +899,101 @@ for gt_name, gt_label in [
     log.info(f"  ✓ Saved → {out}")
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PCA of node distribution space (runs once, not per GT variant)
+# Features: pct_male, dp_gap_data, dp_gap_model, accuracy,
+#           p_smile_true_male, p_smile_true_female  (all from step3/step4 JSONs)
+# ─────────────────────────────────────────────────────────────────────────────
+log.info("  Generating PCA plot of node distribution space...")
+
+step4_path = os.path.join(RESULTS_DIR, f'step4_all_nodes_{PARTITION_ATTR}_results.json')
+step3_path = os.path.join(RESULTS_DIR, f'step3_{ALPHA}_{PARTITION_ATTR}_partition_stats.json')
+
+try:
+    with open(step4_path) as f:
+        step4_data = json.load(f)
+    with open(step3_path) as f:
+        step3_data = json.load(f)
+
+    step4_nodes = {r['node_id']: r for r in step4_data['nodes']}
+    step3_nodes = {r['node_id']: r for r in step3_data['nodes']}
+    node_ids_pca = sorted(step4_nodes.keys())
+
+    feature_names = [
+        'pct_male',
+        'dp_gap_data',
+        'dp_gap_model',
+        'accuracy',
+        'p_smile_true_male',
+        'p_smile_true_female',
+    ]
+
+    X = np.array([
+        [
+            step3_nodes[nid]['pct_male'],
+            step4_nodes[nid]['dp_gap_data'],
+            step4_nodes[nid]['dp_gap_model'],
+            step4_nodes[nid]['accuracy'],
+            step4_nodes[nid]['p_smile_true_male'],
+            step4_nodes[nid]['p_smile_true_female'],
+        ]
+        for nid in node_ids_pca
+    ])
+
+    X_scaled = StandardScaler().fit_transform(X)
+    pca      = PCA(n_components=min(2, X_scaled.shape[1]))
+    coords   = pca.fit_transform(X_scaled)
+    var      = pca.explained_variance_ratio_
+
+    loadings = pca.components_   # shape (n_components, n_features)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle(f'Node Distribution Space — PCA\n'
+                 f'Features: {", ".join(feature_names)}',
+                 fontsize=12, fontweight='bold')
+
+    # Panel 1: scatter of nodes in PC space
+    ax = axes[0]
+    for i, nid in enumerate(node_ids_pca):
+        x, y = coords[i, 0], coords[i, 1] if coords.shape[1] > 1 else 0.0
+        ax.scatter(x, y, color=NODE_COLORS[nid - 1], s=200, zorder=3)
+        ax.annotate(f'Node {nid}', xy=(x, y),
+                    xytext=(6, 4), textcoords='offset points', fontsize=9)
+
+    ax.set_xlabel(f'PC1  ({var[0]:.1%} var)')
+    ax.set_ylabel(f'PC2  ({var[1]:.1%} var)' if len(var) > 1 else 'PC2  (0.0% var)')
+    ax.set_title('Node positions in PC space')
+    ax.axhline(0, color='gray', linewidth=0.5, linestyle='--')
+    ax.axvline(0, color='gray', linewidth=0.5, linestyle='--')
+    ax.spines[['top', 'right']].set_visible(False)
+
+    # Panel 2: loading bar chart — contribution of each feature to PC1 and PC2
+    ax = axes[1]
+    x_pos = np.arange(len(feature_names))
+    bar_w = 0.35
+    ax.bar(x_pos - bar_w / 2, loadings[0], bar_w,
+           label=f'PC1 ({var[0]:.1%})', color='steelblue', alpha=0.85)
+    if len(var) > 1:
+        ax.bar(x_pos + bar_w / 2, loadings[1], bar_w,
+               label=f'PC2 ({var[1]:.1%})', color='salmon', alpha=0.85)
+    ax.axhline(0, color='black', linewidth=0.8)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(feature_names, rotation=30, ha='right', fontsize=8)
+    ax.set_ylabel('Loading')
+    ax.set_title('Feature loadings per PC\n(which features drive each component?)')
+    ax.legend(fontsize=8)
+    ax.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_node_pca_{PARTITION_ATTR}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+
+except FileNotFoundError as e:
+    log.warning(f"  ✗ PCA plot skipped — missing file: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
