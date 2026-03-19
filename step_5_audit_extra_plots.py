@@ -152,20 +152,23 @@ for gt_name, gt_label in [
 
     # Re-alias error fields in all results to point to current GT
     # so all plot code can use r['abs_error'] / r['mean_abs_error'] unchanged
+    # For model_val the primary fields (abs_error, rel_error, mean_abs_error)
+    # are the model_val values; use them as fallback for older JSONs that lack
+    # the explicit _model_val suffixed keys.
     true_dp_gaps = all_true_dp_gaps[gt_name]
     for r in full_results:
-        r['abs_error']   = r[f'abs_error_{gt_name}']
-        r['rel_error']   = r[f'rel_error_{gt_name}']
+        r['abs_error']   = r.get(f'abs_error_{gt_name}',   r['abs_error'])
+        r['rel_error']   = r.get(f'rel_error_{gt_name}',   r['rel_error'])
         r['true_dp_gap'] = r[f'true_dp_gap_{gt_name}']
     for r in budget_results:
-        r['mean_abs_error'] = r[f'mean_abs_error_{gt_name}']
+        r['mean_abs_error'] = r.get(f'mean_abs_error_{gt_name}', r['mean_abs_error'])
         r['true_dp_gap']    = r[f'true_dp_gap_{gt_name}']
         for rep in r['repeats']:
-            rep['abs_error'] = rep[f'abs_error_{gt_name}']
-            rep['rel_error'] = rep[f'rel_error_{gt_name}']
+            rep['abs_error'] = rep.get(f'abs_error_{gt_name}', rep['abs_error'])
+            rep['rel_error'] = rep.get(f'rel_error_{gt_name}', rep['rel_error'])
     for r in global_all_results + global_excl_results:
-        r['abs_error']   = r[f'abs_error_{gt_name}']
-        r['rel_error']   = r[f'rel_error_{gt_name}']
+        r['abs_error']   = r.get(f'abs_error_{gt_name}',   r['abs_error'])
+        r['rel_error']   = r.get(f'rel_error_{gt_name}',   r['rel_error'])
         r['true_dp_gap'] = r[f'true_dp_gap_{gt_name}']
 
     # ─────────────────────────────────────────────────────────────────────────────
