@@ -5,11 +5,15 @@ Extends step_5_audit.py with pairwise AND triplet collaborative auditing.
 All existing audit modes are retained unchanged.
 
 Audit modes:
-  1.   Full local     — each single node audits independently (full data)
-  1.5  Collab pairs   — every pair of non-target nodes pools their full data
-  1.6  Collab triples — every triple of non-target nodes pools their full data
-  2.   Budgeted       — single auditors, sampled budget, 10 repeats
-  3.   Global         — trusted third-party with full dataset (all + excl own)
+  1.   Full local          — each single node audits independently (full data)
+  1.5  Collab pairs        — every pair of non-target nodes pools their full data
+  1.6  Collab triples      — every triple of non-target nodes pools their full data
+  2.   Budgeted single     — single auditors, sampled budget, 10 repeats
+  2.5  Budgeted pairs      — pair coalitions, sampled from pooled data, 10 repeats
+  2.6  Budgeted triples    — triple coalitions, sampled from pooled data, 10 repeats
+  3a.  Global all          — trusted third-party with full dataset
+  3b.  Global excl (full)  — full dataset minus target's own partition
+  3c.  Global excl budget  — global_excl pool, sampled budget, 10 repeats
 
 Skip logic:
   If step5c_audit_results_{PARTITION_ATTR}.json already exists and contains
@@ -118,7 +122,8 @@ RESULTS_FNAME = f'step5c_audit_results_{PARTITION_ATTR}.json'
 # Keys that must be present for the skip logic to accept an existing JSON
 REQUIRED_KEYS = {
     'full_results', 'collab_pair_results', 'collab_triple_results',
-    'budget_results', 'global_all_results', 'global_excl_results',
+    'budget_results', 'collab_pair_budget_results', 'collab_triple_budget_results',
+    'global_all_results', 'global_excl_results', 'global_excl_budget_results',
 }
 
 
@@ -280,6 +285,88 @@ def _run_collab_audits(model, dataset, node_indices, target_id, other_nodes,
     return results
 
 
+def _run_collab_budget_audits(model, dataset, node_indices, target_id, other_nodes,
+                              coalition_size, budget_sizes, num_repeats,
+                              true_dp, true_dp_data, true_dp_model_full,
+                              gender_attr, device, tag, audit_seed):
+    """
+    Budgeted collaborative audits for all coalitions of a given size.
+    For each (coalition, budget): sample from the combined pool, repeat
+    num_repeats times with different seeds, aggregate with bootstrap CI.
+    """
+    results = []
+    for coalition in combinations(other_nodes, coalition_size):
+        idx_parts    = [node_indices[n - 1] for n in coalition]
+        gender_parts = [np.array(dataset[gender_attr], dtype=np.int64)[idx]
+                        for idx in idx_parts]
+        combined_indices = np.concatenate(idx_parts)
+        combined_gender  = np.concatenate(gender_parts)
+        n_available      = len(combined_indices)
+        label            = '+'.join(str(n) for n in coalition)
+        # Unique seed offset per coalition so repeats differ across coalitions
+        coalition_seed   = sum(n * (10 ** i) for i, n in enumerate(sorted(coalition)))
+
+        for budget in budget_sizes:
+            actual_budget  = min(budget, n_available)
+            repeat_results = []
+
+            for rep in range(num_repeats):
+                rng = np.random.default_rng(
+                    audit_seed + coalition_seed + target_id * 100 + rep)
+                sampled   = rng.choice(n_available, size=actual_budget, replace=False)
+                s_indices = combined_indices[sampled]
+                s_gender  = combined_gender[sampled]
+
+                r = run_single_audit(model, dataset, s_indices, s_gender,
+                                     true_dp, device)
+                _add_gt_errors(r, true_dp_data, true_dp_model_full)
+                r.update({
+                    'mode'         : f'collab_{coalition_size}_budgeted',
+                    'auditor_ids'  : list(coalition),
+                    'auditor_id'   : label,
+                    'target_id'    : target_id,
+                    'budget'       : budget,
+                    'repeat'       : rep,
+                    'actual_budget': actual_budget,
+                })
+                repeat_results.append(r)
+
+            est_dps       = [r['est_dp_gap']           for r in repeat_results]
+            abs_errs      = [r['abs_error']            for r in repeat_results]
+            abs_errs_data = [r['abs_error_data']       for r in repeat_results]
+            abs_errs_full = [r['abs_error_model_full'] for r in repeat_results]
+
+            mean_dp,       ci_lo, ci_hi = bootstrap_ci(est_dps,       seed=audit_seed)
+            mean_abs,      _,     _     = bootstrap_ci(abs_errs,       seed=audit_seed)
+            mean_abs_data, _,     _     = bootstrap_ci(abs_errs_data,  seed=audit_seed)
+            mean_abs_full, _,     _     = bootstrap_ci(abs_errs_full,  seed=audit_seed)
+
+            results.append({
+                'mode'                     : f'collab_{coalition_size}_budgeted_agg',
+                'auditor_ids'              : list(coalition),
+                'auditor_id'               : label,
+                'target_id'                : target_id,
+                'budget'                   : budget,
+                'actual_budget'            : actual_budget,
+                'true_dp_gap_model_val'    : true_dp,
+                'true_dp_gap_data'         : true_dp_data,
+                'true_dp_gap_model_full'   : true_dp_model_full,
+                'mean_est_dp'              : mean_dp,
+                'std_est_dp'               : float(np.std(est_dps)),
+                'ci_lower'                 : ci_lo,
+                'ci_upper'                 : ci_hi,
+                'mean_abs_error'           : mean_abs,
+                'mean_abs_error_model_val' : mean_abs,
+                'mean_abs_error_data'      : mean_abs_data,
+                'mean_abs_error_model_full': mean_abs_full,
+                'repeats'                  : repeat_results,
+            })
+            print(f'{tag} Collab {coalition_size} bud | ({label}) budget={budget} → '
+                  f'mean_est_dp={mean_dp:.4f} ± {np.std(est_dps):.4f}  '
+                  f'mean_abs_err={mean_abs:.4f}', flush=True)
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker: audits one TARGET node (called in a separate process per GPU)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,6 +510,24 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
                       f'mean_est_dp={mean_dp:.4f} ± {np.std(est_dps):.4f}  '
                       f'mean_abs_err={mean_abs:.4f}', flush=True)
 
+        # ── Mode 2.5: Budgeted pairwise collaborative audits ──────────────────
+        collab_pair_budget_results = _run_collab_budget_audits(
+            model, dataset, node_indices, target_id, other_nodes,
+            coalition_size=2, budget_sizes=budget_sizes, num_repeats=num_repeats,
+            true_dp=true_dp, true_dp_data=true_dp_data,
+            true_dp_model_full=true_dp_model_full,
+            gender_attr=gender_attr, device=device, tag=tag,
+            audit_seed=cfg['audit']['seed'])
+
+        # ── Mode 2.6: Budgeted triplet collaborative audits ───────────────────
+        collab_triple_budget_results = _run_collab_budget_audits(
+            model, dataset, node_indices, target_id, other_nodes,
+            coalition_size=3, budget_sizes=budget_sizes, num_repeats=num_repeats,
+            true_dp=true_dp, true_dp_data=true_dp_data,
+            true_dp_model_full=true_dp_model_full,
+            gender_attr=gender_attr, device=device, tag=tag,
+            audit_seed=cfg['audit']['seed'])
+
         # ── Mode 3: Global audit ──────────────────────────────────────────────
         r_global_all = run_single_audit(model, dataset, global_indices,
                                         global_gender, true_dp, device)
@@ -447,13 +552,71 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
               f'est_dp={r_global_excl["est_dp_gap"]:.4f}  '
               f'abs_err={r_global_excl["abs_error"]:.4f}', flush=True)
 
+        # ── Mode 3c: Budgeted global_excl ─────────────────────────────────────
+        n_excl = len(global_excl_indices)
+        global_excl_budget_results = []
+        for budget in budget_sizes:
+            actual_budget  = min(budget, n_excl)
+            repeat_results = []
+            for rep in range(num_repeats):
+                rng = np.random.default_rng(
+                    cfg['audit']['seed'] + target_id * 100 + rep + 9999)
+                sampled   = rng.choice(n_excl, size=actual_budget, replace=False)
+                s_indices = global_excl_indices[sampled]
+                s_gender  = global_excl_gender[sampled]
+                r = run_single_audit(model, dataset, s_indices, s_gender,
+                                     true_dp, device)
+                _add_gt_errors(r, true_dp_data, true_dp_model_full)
+                r.update({
+                    'mode': 'global_excl_budgeted', 'auditor_id': 'global_excl',
+                    'target_id': target_id, 'budget': budget,
+                    'repeat': rep, 'actual_budget': actual_budget,
+                })
+                repeat_results.append(r)
+
+            est_dps       = [r['est_dp_gap']           for r in repeat_results]
+            abs_errs_val  = [r['abs_error']            for r in repeat_results]
+            abs_errs_data = [r['abs_error_data']       for r in repeat_results]
+            abs_errs_full = [r['abs_error_model_full'] for r in repeat_results]
+
+            mean_dp,       ci_lo, ci_hi = bootstrap_ci(est_dps,       seed=cfg['audit']['seed'])
+            mean_abs,      _,     _     = bootstrap_ci(abs_errs_val,  seed=cfg['audit']['seed'])
+            mean_abs_data, _,     _     = bootstrap_ci(abs_errs_data, seed=cfg['audit']['seed'])
+            mean_abs_full, _,     _     = bootstrap_ci(abs_errs_full, seed=cfg['audit']['seed'])
+
+            global_excl_budget_results.append({
+                'mode'                     : 'global_excl_budgeted_agg',
+                'auditor_id'               : 'global_excl',
+                'target_id'                : target_id,
+                'budget'                   : budget,
+                'actual_budget'            : actual_budget,
+                'true_dp_gap_model_val'    : true_dp,
+                'true_dp_gap_data'         : true_dp_data,
+                'true_dp_gap_model_full'   : true_dp_model_full,
+                'mean_est_dp'              : mean_dp,
+                'std_est_dp'               : float(np.std(est_dps)),
+                'ci_lower'                 : ci_lo,
+                'ci_upper'                 : ci_hi,
+                'mean_abs_error'           : mean_abs,
+                'mean_abs_error_model_val' : mean_abs,
+                'mean_abs_error_data'      : mean_abs_data,
+                'mean_abs_error_model_full': mean_abs_full,
+                'repeats'                  : repeat_results,
+            })
+            print(f'{tag} Global excl bud | budget={budget} → '
+                  f'mean_est_dp={mean_dp:.4f} ± {np.std(est_dps):.4f}  '
+                  f'mean_abs_err={mean_abs:.4f}', flush=True)
+
         result_queue.put(('success', target_id, {
-            'full'           : full_results,
-            'collab_pairs'   : collab_pair_results,
-            'collab_triples' : collab_triple_results,
-            'budget'         : budget_results,
-            'global_all'     : r_global_all,
-            'global_excl'    : r_global_excl,
+            'full'                    : full_results,
+            'collab_pairs'            : collab_pair_results,
+            'collab_triples'          : collab_triple_results,
+            'budget'                  : budget_results,
+            'collab_pairs_budget'     : collab_pair_budget_results,
+            'collab_triples_budget'   : collab_triple_budget_results,
+            'global_all'              : r_global_all,
+            'global_excl'             : r_global_excl,
+            'global_excl_budget'      : global_excl_budget_results,
         }))
 
     except Exception as e:
@@ -649,15 +812,98 @@ def plot_collab_all_modes(full_results, collab_pair_results,
     return out
 
 
+def plot_budget_collab_comparison(budget_results, collab_pair_budget_results,
+                                   collab_triple_budget_results,
+                                   global_excl_budget_results, plot_dir):
+    """
+    Mean absolute error vs budget for single / pair / triple / global_excl,
+    one subplot per target node.  Uses mean_abs_error (model_val ground truth).
+    """
+    target_ids = sorted(set(r['target_id'] for r in budget_results))
+    fig, axes  = plt.subplots(1, len(target_ids),
+                               figsize=(5 * len(target_ids), 5), sharey=True)
+    if len(target_ids) == 1:
+        axes = [axes]
+    fig.suptitle('Mean Absolute Error vs Query Budget\n'
+                 'Single / Pair / Triple Collaborative / Global-Excl',
+                 fontsize=13, fontweight='bold')
+
+    for ax, target_id in zip(axes, target_ids):
+        budget_sizes = sorted(set(r['budget'] for r in budget_results
+                                  if r['target_id'] == target_id))
+        # Single: average across all auditors per budget
+        single_means, single_stds = [], []
+        for b in budget_sizes:
+            vals = [r['mean_abs_error'] for r in budget_results
+                    if r['target_id'] == target_id and r['budget'] == b]
+            single_means.append(np.mean(vals))
+            single_stds.append(np.std(vals))
+
+        # Pair: average across all coalitions per budget
+        pair_means, pair_stds = [], []
+        for b in budget_sizes:
+            vals = [r['mean_abs_error'] for r in collab_pair_budget_results
+                    if r['target_id'] == target_id and r['budget'] == b]
+            pair_means.append(np.mean(vals) if vals else np.nan)
+            pair_stds.append(np.std(vals) if vals else np.nan)
+
+        # Triple: average across all coalitions per budget
+        triple_means, triple_stds = [], []
+        for b in budget_sizes:
+            vals = [r['mean_abs_error'] for r in collab_triple_budget_results
+                    if r['target_id'] == target_id and r['budget'] == b]
+            triple_means.append(np.mean(vals) if vals else np.nan)
+            triple_stds.append(np.std(vals) if vals else np.nan)
+
+        # Global_excl budgeted
+        ge_means, ge_stds = [], []
+        for b in budget_sizes:
+            vals = [r['mean_abs_error'] for r in global_excl_budget_results
+                    if r['target_id'] == target_id and r['budget'] == b]
+            ge_means.append(np.mean(vals) if vals else np.nan)
+            ge_stds.append(np.std(vals) if vals else np.nan)
+
+        xs = np.array(budget_sizes)
+        for means, stds, label, color, ls in [
+            (single_means, single_stds,  'Single',       'steelblue',   '-'),
+            (pair_means,   pair_stds,    'Pair collab',  '#b0b0b0',     '--'),
+            (triple_means, triple_stds,  'Triple collab','#606060',     '-.'),
+            (ge_means,     ge_stds,      'Global excl',  'darkorange',  ':'),
+        ]:
+            means = np.array(means, dtype=float)
+            stds  = np.array(stds,  dtype=float)
+            ax.plot(xs, means, color=color, linestyle=ls, marker='o',
+                    linewidth=1.8, markersize=5, label=label)
+            ax.fill_between(xs, means - stds, means + stds,
+                            alpha=0.15, color=color)
+
+        ax.set_xscale('log')
+        ax.set_xlabel('Query budget')
+        ax.set_title(f'Target: Node {target_id}', fontweight='bold')
+        ax.legend(fontsize=8)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    axes[0].set_ylabel('Mean Abs Error (model_val GT)')
+    plt.tight_layout()
+    out = os.path.join(plot_dir, f'step5c_budget_collab_comparison_{PARTITION_ATTR}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Plot-only path: regenerate all plots from an existing results JSON
 # ─────────────────────────────────────────────────────────────────────────────
 def regenerate_plots(data, node_partition_stats):
-    full_results          = data['full_results']
-    collab_pair_results   = data['collab_pair_results']
-    collab_triple_results = data['collab_triple_results']
-    global_all_results    = data['global_all_results']
-    global_excl_results   = data['global_excl_results']
+    full_results                = data['full_results']
+    collab_pair_results         = data['collab_pair_results']
+    collab_triple_results       = data['collab_triple_results']
+    budget_results              = data['budget_results']
+    collab_pair_budget_results  = data['collab_pair_budget_results']
+    collab_triple_budget_results = data['collab_triple_budget_results']
+    global_all_results          = data['global_all_results']
+    global_excl_results         = data['global_excl_results']
+    global_excl_budget_results  = data['global_excl_budget_results']
 
     log.info(f"\n{'─'*70}")
     log.info("  Generating Plots (from cached results)")
@@ -672,6 +918,10 @@ def regenerate_plots(data, node_partition_stats):
     log.info(f"  ✓ {out}")
     out = plot_collab_all_modes(full_results, collab_pair_results,
                                  collab_triple_results, PLOT_DIR)
+    log.info(f"  ✓ {out}")
+    out = plot_budget_collab_comparison(budget_results, collab_pair_budget_results,
+                                        collab_triple_budget_results,
+                                        global_excl_budget_results, PLOT_DIR)
     log.info(f"  ✓ {out}")
 
 
@@ -806,20 +1056,26 @@ def main():
     log.info(f"\n  All targets finished in {total_time:.0f}s ({total_time/60:.1f} min)\n")
 
     # ── Flatten results ────────────────────────────────────────────────────────
-    full_results          = []
-    collab_pair_results   = []
-    collab_triple_results = []
-    budget_results        = []
-    global_all_results    = []
-    global_excl_results   = []
+    full_results                = []
+    collab_pair_results         = []
+    collab_triple_results       = []
+    budget_results              = []
+    collab_pair_budget_results  = []
+    collab_triple_budget_results = []
+    global_all_results          = []
+    global_excl_results         = []
+    global_excl_budget_results  = []
 
     for target_id, res in all_results.items():
         full_results.extend(res['full'])
         collab_pair_results.extend(res['collab_pairs'])
         collab_triple_results.extend(res['collab_triples'])
         budget_results.extend(res['budget'])
+        collab_pair_budget_results.extend(res['collab_pairs_budget'])
+        collab_triple_budget_results.extend(res['collab_triples_budget'])
         global_all_results.append(res['global_all'])
         global_excl_results.append(res['global_excl'])
+        global_excl_budget_results.extend(res['global_excl_budget'])
 
     if not full_results:
         log.info("  ✗ No successful audits — exiting")
@@ -839,6 +1095,10 @@ def main():
     log.info(f"  ✓ {out}")
     out = plot_collab_all_modes(full_results, collab_pair_results,
                                  collab_triple_results, PLOT_DIR)
+    log.info(f"  ✓ {out}")
+    out = plot_budget_collab_comparison(budget_results, collab_pair_budget_results,
+                                        collab_triple_budget_results,
+                                        global_excl_budget_results, PLOT_DIR)
     log.info(f"  ✓ {out}")
 
     # ── Save results JSON ──────────────────────────────────────────────────────
@@ -861,12 +1121,15 @@ def main():
         'true_dp_gaps_model_val'  : true_dp_gaps,
         'true_dp_gaps_data'       : true_dp_gaps_data,
         'true_dp_gaps_model_full' : true_dp_gaps_model_full,
-        'full_results'            : full_results,
-        'collab_pair_results'     : collab_pair_results,
-        'collab_triple_results'   : collab_triple_results,
-        'budget_results'          : budget_results,
-        'global_all_results'      : global_all_results,
-        'global_excl_results'     : global_excl_results,
+        'full_results'                : full_results,
+        'collab_pair_results'         : collab_pair_results,
+        'collab_triple_results'       : collab_triple_results,
+        'budget_results'              : budget_results,
+        'collab_pair_budget_results'  : collab_pair_budget_results,
+        'collab_triple_budget_results': collab_triple_budget_results,
+        'global_all_results'          : global_all_results,
+        'global_excl_results'         : global_excl_results,
+        'global_excl_budget_results'  : global_excl_budget_results,
         'summary': {
             'full_mean_abs_error_model_val' : float(abs_errs.mean()),
             'full_std_abs_error_model_val'  : float(abs_errs.std()),
@@ -893,6 +1156,7 @@ def main():
     log.info(f"\n  Outputs saved to: {EXP_DIR}")
     log.info(f"    results/{RUN_DATE}/{RESULTS_FNAME}")
     log.info(f"    plots/{RUN_DATE}/step5c_collab_all_modes_{PARTITION_ATTR}.png")
+    log.info(f"    plots/{RUN_DATE}/step5c_budget_collab_comparison_{PARTITION_ATTR}.png")
     log.info(f"    logs/{RUN_DATE}/step5c_{PARTITION_ATTR}.log")
     log.info(f"{'='*70}")
 
