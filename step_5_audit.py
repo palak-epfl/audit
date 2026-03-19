@@ -37,6 +37,7 @@ import logging
 import argparse
 import datetime
 import time
+from itertools import combinations
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -322,6 +323,36 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
                   f'abs_err(data)={r["abs_error_data"]:.4f}  '
                   f'abs_err(model_full)={r["abs_error_model_full"]:.4f}', flush=True)
 
+        # ── Mode 1.5: Pairwise collaborative audits (full data, all pairs) ──────
+        # Each pair of non-target nodes pools their full data and audits jointly.
+        collab_pair_results = []
+        other_nodes = [n for n in range(1, num_nodes + 1) if n != target_id]
+        gender_attr = cfg['dataset']['sensitive_attr']
+        for node_a, node_b in combinations(other_nodes, 2):
+            idx_a    = node_indices[node_a - 1]
+            idx_b    = node_indices[node_b - 1]
+            gender_a = np.array(dataset[gender_attr], dtype=np.int64)[idx_a]
+            gender_b = np.array(dataset[gender_attr], dtype=np.int64)[idx_b]
+
+            combined_indices = np.concatenate([idx_a, idx_b])
+            combined_gender  = np.concatenate([gender_a, gender_b])
+
+            r = run_single_audit(model, dataset, combined_indices,
+                                 combined_gender, true_dp, device)
+            _add_gt_errors(r, true_dp_data, true_dp_model_full)
+            r.update({
+                'mode'       : 'collab_pair',
+                'auditor_ids': [node_a, node_b],
+                'auditor_id' : f'{node_a}+{node_b}',
+                'target_id'  : target_id,
+            })
+            collab_pair_results.append(r)
+            print(f'{tag} Collab pair  | ({node_a},{node_b}) → '
+                  f'n={len(combined_indices):,}  '
+                  f'est_dp={r["est_dp_gap"]:.4f}  '
+                  f'abs_err(model_val)={r["abs_error"]:.4f}  '
+                  f'abs_err(data)={r["abs_error_data"]:.4f}', flush=True)
+
         # ── Mode 2: Budgeted audits (all auditors, all budgets, all repeats) ──
         budget_results = []
         for auditor_id in range(1, num_nodes + 1):
@@ -431,10 +462,11 @@ def audit_target_node(target_id, gpu_id, dataset, node_indices,
               f'abs_err={r_global_excl["abs_error"]:.4f}', flush=True)
 
         result_queue.put(('success', target_id, {
-            'full'        : full_results,
-            'budget'      : budget_results,
-            'global_all'  : r_global_all,
-            'global_excl' : r_global_excl,
+            'full'         : full_results,
+            'collab_pairs' : collab_pair_results,
+            'budget'       : budget_results,
+            'global_all'   : r_global_all,
+            'global_excl'  : r_global_excl,
         }))
 
     except Exception as e:
@@ -699,6 +731,71 @@ def plot_global_vs_local(full_results, global_all_results, global_excl_results, 
     return out
 
 
+def plot_collab_vs_single(full_results, collab_pair_results, plot_dir):
+    """
+    For each target node: side-by-side comparison of single-node auditor
+    estimates vs all pairwise collaborative estimates.
+    Helps visualise whether pooling two nodes' data improves accuracy.
+    """
+    target_ids = sorted(set(r['target_id'] for r in full_results))
+    n_targets  = len(target_ids)
+
+    fig, axes = plt.subplots(1, n_targets, figsize=(5 * n_targets, 5), sharey=True)
+    if n_targets == 1:
+        axes = [axes]
+    fig.suptitle('Single-Node vs Pairwise Collaborative Auditors per Target\n'
+                 '(bars = estimated DP gap, black dashed = true DP model/val)',
+                 fontsize=13, fontweight='bold')
+
+    for ax, target_id in zip(axes, target_ids):
+        singles = sorted([r for r in full_results   if r['target_id'] == target_id],
+                         key=lambda r: r['auditor_id'])
+        pairs   = sorted([r for r in collab_pair_results if r['target_id'] == target_id],
+                         key=lambda r: r['auditor_id'])
+
+        true_dp = singles[0]['true_dp_gap_model_val'] if singles else 0.0
+
+        labels = [f"N{r['auditor_id']}"       for r in singles] + \
+                 [f"N{r['auditor_id']}"        for r in pairs]
+        values = [r['est_dp_gap'] for r in singles] + \
+                 [r['est_dp_gap'] for r in pairs]
+        colors = [NODE_COLORS[r['auditor_id'] - 1] for r in singles] + \
+                 ['#b0b0b0'] * len(pairs)
+        hatches = [''] * len(singles) + ['//'] * len(pairs)
+
+        x_pos = np.arange(len(labels))
+        for x, val, col, hatch in zip(x_pos, values, colors, hatches):
+            ax.bar(x, val, color=col, edgecolor='white', linewidth=0.8,
+                   width=0.7, hatch=hatch, zorder=3)
+            ax.text(x, val + 0.003, f'{val:.3f}', ha='center', va='bottom',
+                    fontsize=6, rotation=90)
+
+        # Divider between singles and pairs
+        if singles and pairs:
+            ax.axvline(len(singles) - 0.5, color='gray', linestyle=':', linewidth=1)
+            ax.text(len(singles) / 2 - 0.5, ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 0.05,
+                    'single', ha='center', va='bottom', fontsize=7, color='gray')
+            ax.text(len(singles) + len(pairs) / 2 - 0.5,
+                    ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 0.05,
+                    'pairs', ha='center', va='bottom', fontsize=7, color='gray')
+
+        ax.axhline(true_dp, color='black', linestyle='--', linewidth=1.5,
+                   label=f'True DP model/val ({true_dp:.3f})', zorder=2)
+        ax.set_title(f'Target: Node {target_id}', fontweight='bold')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(labels, fontsize=7, rotation=45, ha='right')
+        ax.set_ylim(0, max(values + [true_dp]) * 1.3)
+        ax.legend(fontsize=7)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    axes[0].set_ylabel('Estimated DP Gap')
+    plt.tight_layout()
+    out = os.path.join(plot_dir, f'step5_collab_vs_single_{PARTITION_ATTR}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    return out
+
+
 def plot_ranking_accuracy(full_results, budget_results,
                           global_all_results, global_excl_results,
                           true_dp_gaps, plot_dir):
@@ -944,12 +1041,14 @@ def main():
 
     # ── Flatten results ────────────────────────────────────────────────────────
     full_results        = []
+    collab_pair_results = []
     budget_results      = []
     global_all_results  = []
     global_excl_results = []
 
     for target_id, res in all_target_results.items():
         full_results.extend(res['full'])
+        collab_pair_results.extend(res['collab_pairs'])
         budget_results.extend(res['budget'])
         global_all_results.append(res['global_all'])
         global_excl_results.append(res['global_excl'])
@@ -1014,6 +1113,9 @@ def main():
     out = plot_global_vs_local(full_results, global_all_results, global_excl_results, PLOT_DIR)
     log.info(f"  ✓ {out}")
 
+    out = plot_collab_vs_single(full_results, collab_pair_results, PLOT_DIR)
+    log.info(f"  ✓ {out}")
+
     out = plot_ranking_accuracy(
         full_results, budget_results,
         global_all_results, global_excl_results, true_dp_gaps, PLOT_DIR)
@@ -1039,6 +1141,7 @@ def main():
         'true_dp_gaps_data'       : true_dp_gaps_data,
         'true_dp_gaps_model_full' : true_dp_gaps_model_full,
         'full_results'         : full_results,
+        'collab_pair_results'  : collab_pair_results,
         'budget_results'       : budget_results,
         'global_all_results'   : global_all_results,
         'global_excl_results'  : global_excl_results,
