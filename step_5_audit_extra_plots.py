@@ -88,6 +88,18 @@ budget_results      = data['budget_results']
 global_all_results  = data['global_all_results']
 global_excl_results = data['global_excl_results']
 collab_pair_results = data.get('collab_pair_results', [])
+
+# Also load triple (and any larger coalition) results from step5c JSON if present
+step5c_path = os.path.join(RESULTS_DIR, f'step5c_audit_results_{PARTITION_ATTR}.json')
+collab_triple_results = []
+if os.path.exists(step5c_path):
+    with open(step5c_path) as _f:
+        _step5c = json.load(_f)
+    collab_triple_results = _step5c.get('collab_triple_results', [])
+    # step5c may have richer pair results too; only override if step5 JSON had none
+    if not collab_pair_results:
+        collab_pair_results = _step5c.get('collab_pair_results', [])
+    log.info(f"  ✓ step5c JSON loaded — triples: {len(collab_triple_results)}")
 budget_sizes        = sorted(set(r['budget'] for r in budget_results))
 auditor_ids         = sorted(set(r['auditor_id'] for r in full_results))
 
@@ -998,53 +1010,71 @@ except FileNotFoundError as e:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plot 7: Single vs pairwise collaborative auditors — two true DP reference
-#         lines (model_val and data labels)
+# Plot 7: Single vs collaborative auditors (any coalition size available)
+#         Two true DP reference lines: model/val and data labels.
+#         Groups: single | pairs (if present) | triples (if present) | ...
 # ─────────────────────────────────────────────────────────────────────────────
-if collab_pair_results:
-    log.info("  Generating Plot 7: Single vs pairwise collab (two true DP refs)...")
+# Build ordered list of (group_label, results_list, bar_color, hatch)
+_collab_groups = [
+    ('single',  full_results,           NODE_COLORS,  ''),
+    ('pairs',   collab_pair_results,    ['#b0b0b0'],  '//'),
+    ('triples', collab_triple_results,  ['#606060'],  'xx'),
+]
+# Keep only groups that have data
+_collab_groups = [(lbl, res, col, hat)
+                  for lbl, res, col, hat in _collab_groups if res]
+
+if _collab_groups:
+    log.info("  Generating Plot 7: Single vs collaborative auditors (all sizes)...")
 
     target_ids_collab = sorted(set(r['target_id'] for r in full_results))
     n_targets  = len(target_ids_collab)
 
-    fig, axes = plt.subplots(1, n_targets, figsize=(5 * n_targets, 5), sharey=True)
+    fig, axes = plt.subplots(1, n_targets, figsize=(6 * n_targets, 5), sharey=True)
     if n_targets == 1:
         axes = [axes]
-    fig.suptitle('Single-Node vs Pairwise Collaborative Auditors per Target\n'
+    group_names = ' vs '.join(lbl for lbl, _, _, _ in _collab_groups)
+    fig.suptitle(f'Collaborative Auditors per Target: {group_names}\n'
                  '(bars = estimated DP gap; dashed = true DP model/val, dotted = true DP data)',
                  fontsize=13, fontweight='bold')
 
     for ax, target_id in zip(axes, target_ids_collab):
-        singles = sorted([r for r in full_results        if r['target_id'] == target_id],
-                         key=lambda r: r['auditor_id'])
-        pairs   = sorted([r for r in collab_pair_results if r['target_id'] == target_id],
-                         key=lambda r: r['auditor_id'])
+        all_labels, all_values, all_colors, all_hatches = [], [], [], []
+        group_spans = []   # (start_x, end_x, label) for dividers + group text
 
-        true_dp_mv   = singles[0]['true_dp_gap_model_val']       if singles else 0.0
-        true_dp_data = singles[0].get('true_dp_gap_data', true_dp_mv) if singles else 0.0
+        for lbl, res, col_spec, hatch in _collab_groups:
+            group_rows = sorted([r for r in res if r['target_id'] == target_id],
+                                key=lambda r: str(r['auditor_id']))
+            start_x = len(all_labels)
+            for r in group_rows:
+                all_labels.append(f"N{r['auditor_id']}")
+                all_values.append(r['est_dp_gap'])
+                # single uses per-node color; collab groups use fixed color
+                if lbl == 'single':
+                    all_colors.append(NODE_COLORS[r['auditor_id'] - 1])
+                else:
+                    all_colors.append(col_spec[0])
+                all_hatches.append(hatch)
+            group_spans.append((start_x, len(all_labels) - 1, lbl))
 
-        labels  = [f"N{r['auditor_id']}" for r in singles] + \
-                  [f"N{r['auditor_id']}" for r in pairs]
-        values  = [r['est_dp_gap'] for r in singles] + \
-                  [r['est_dp_gap'] for r in pairs]
-        colors  = [NODE_COLORS[r['auditor_id'] - 1] for r in singles] + \
-                  ['#b0b0b0'] * len(pairs)
-        hatches = [''] * len(singles) + ['//'] * len(pairs)
+        singles_ref = [r for r in full_results if r['target_id'] == target_id]
+        true_dp_mv   = singles_ref[0]['true_dp_gap_model_val']           if singles_ref else 0.0
+        true_dp_data = singles_ref[0].get('true_dp_gap_data', true_dp_mv) if singles_ref else 0.0
 
-        x_pos = np.arange(len(labels))
-        for x, val, col, hatch in zip(x_pos, values, colors, hatches):
+        x_pos = np.arange(len(all_labels))
+        for x, val, col, hatch in zip(x_pos, all_values, all_colors, all_hatches):
             ax.bar(x, val, color=col, edgecolor='white', linewidth=0.8,
                    width=0.7, hatch=hatch, zorder=3)
             ax.text(x, val + 0.003, f'{val:.3f}', ha='center', va='bottom',
                     fontsize=6, rotation=90)
 
-        if singles and pairs:
-            ax.axvline(len(singles) - 0.5, color='gray', linestyle=':', linewidth=1)
-            y_top = max(values) * 1.3
-            ax.text(len(singles) / 2 - 0.5, y_top * 0.97,
-                    'single', ha='center', va='top', fontsize=7, color='gray')
-            ax.text(len(singles) + len(pairs) / 2 - 0.5, y_top * 0.97,
-                    'pairs', ha='center', va='top', fontsize=7, color='gray')
+        y_top = max(all_values + [true_dp_mv, true_dp_data]) * 1.3
+        for i, (start_x, end_x, lbl) in enumerate(group_spans):
+            if i > 0:
+                ax.axvline(start_x - 0.5, color='gray', linestyle=':', linewidth=1)
+            cx = (start_x + end_x) / 2
+            ax.text(cx, y_top * 0.97, lbl, ha='center', va='top',
+                    fontsize=7, color='gray')
 
         ax.axhline(true_dp_mv,   color='black', linestyle='--', linewidth=1.5,
                    label=f'True DP model/val ({true_dp_mv:.3f})', zorder=2)
@@ -1053,8 +1083,8 @@ if collab_pair_results:
 
         ax.set_title(f'Target: Node {target_id}', fontweight='bold')
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(labels, fontsize=7, rotation=45, ha='right')
-        ax.set_ylim(0, max(values + [true_dp_mv, true_dp_data]) * 1.3)
+        ax.set_xticklabels(all_labels, fontsize=6, rotation=45, ha='right')
+        ax.set_ylim(0, y_top)
         ax.legend(fontsize=7)
         ax.spines[['top', 'right']].set_visible(False)
 
@@ -1065,7 +1095,7 @@ if collab_pair_results:
     plt.close()
     log.info(f"  ✓ Saved → {out}")
 else:
-    log.warning("  ✗ Plot 7 skipped — no collab_pair_results in results JSON")
+    log.warning("  ✗ Plot 7 skipped — no collab results found")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
