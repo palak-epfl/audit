@@ -658,14 +658,23 @@ def plot_global_vs_local(full_results, global_all_results, global_excl_results, 
 
         g_all  = next(r for r in global_all_results  if r['target_id'] == target_id)
         g_excl = next(r for r in global_excl_results if r['target_id'] == target_id)
-        true_dp = g_all['true_dp_gap_model_val']
+
+        true_dp_model_val  = g_all['true_dp_gap_model_val']
+        true_dp_data       = g_all['true_dp_gap_data']
+        true_dp_model_full = g_all['true_dp_gap_model_full']
 
         x_local = range(len(local))
         ax.bar(x_local, local_ests,
                color=[NODE_COLORS[i-1] for i in local_aud_ids],
                edgecolor='white', linewidth=1.2, label='Local auditors')
-        ax.axhline(true_dp, color='black', linestyle='--',
-                   linewidth=1.5, label=f'True DP ({true_dp:.3f})')
+
+        ax.axhline(true_dp_model_val,  color='black',  linestyle='--',
+                   linewidth=1.5, label=f'True DP — model/val ({true_dp_model_val:.3f})')
+        ax.axhline(true_dp_model_full, color='dimgray', linestyle='-.',
+                   linewidth=1.5, label=f'True DP — model/full ({true_dp_model_full:.3f})')
+        ax.axhline(true_dp_data,       color='gray',   linestyle=':',
+                   linewidth=1.5, label=f'True DP — data labels ({true_dp_data:.3f})')
+
         ax.axhline(g_all['est_dp_gap'],  color='red',    linestyle='-.',
                    linewidth=1.5, label=f'Global all ({g_all["est_dp_gap"]:.3f})')
         ax.axhline(g_excl['est_dp_gap'], color='orange', linestyle=':',
@@ -675,7 +684,8 @@ def plot_global_vs_local(full_results, global_all_results, global_excl_results, 
         ax.set_xlabel('Auditor Node')
         ax.set_xticks(list(x_local))
         ax.set_xticklabels([f'N{i}' for i in local_aud_ids])
-        ax.set_ylim(0, max(local_ests + [true_dp,
+        ax.set_ylim(0, max(local_ests + [true_dp_model_val, true_dp_data,
+                                         true_dp_model_full,
                                          g_all['est_dp_gap'],
                                          g_excl['est_dp_gap']]) * 1.3)
         ax.legend(fontsize=7)
