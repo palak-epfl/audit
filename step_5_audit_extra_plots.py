@@ -87,6 +87,7 @@ full_results        = data['full_results']
 budget_results      = data['budget_results']
 global_all_results  = data['global_all_results']
 global_excl_results = data['global_excl_results']
+collab_pair_results = data.get('collab_pair_results', [])
 budget_sizes        = sorted(set(r['budget'] for r in budget_results))
 auditor_ids         = sorted(set(r['auditor_id'] for r in full_results))
 
@@ -994,6 +995,77 @@ try:
 
 except FileNotFoundError as e:
     log.warning(f"  ✗ PCA plot skipped — missing file: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 7: Single vs pairwise collaborative auditors — two true DP reference
+#         lines (model_val and data labels)
+# ─────────────────────────────────────────────────────────────────────────────
+if collab_pair_results:
+    log.info("  Generating Plot 7: Single vs pairwise collab (two true DP refs)...")
+
+    target_ids_collab = sorted(set(r['target_id'] for r in full_results))
+    n_targets  = len(target_ids_collab)
+
+    fig, axes = plt.subplots(1, n_targets, figsize=(5 * n_targets, 5), sharey=True)
+    if n_targets == 1:
+        axes = [axes]
+    fig.suptitle('Single-Node vs Pairwise Collaborative Auditors per Target\n'
+                 '(bars = estimated DP gap; dashed = true DP model/val, dotted = true DP data)',
+                 fontsize=13, fontweight='bold')
+
+    for ax, target_id in zip(axes, target_ids_collab):
+        singles = sorted([r for r in full_results        if r['target_id'] == target_id],
+                         key=lambda r: r['auditor_id'])
+        pairs   = sorted([r for r in collab_pair_results if r['target_id'] == target_id],
+                         key=lambda r: r['auditor_id'])
+
+        true_dp_mv   = singles[0]['true_dp_gap_model_val']       if singles else 0.0
+        true_dp_data = singles[0].get('true_dp_gap_data', true_dp_mv) if singles else 0.0
+
+        labels  = [f"N{r['auditor_id']}" for r in singles] + \
+                  [f"N{r['auditor_id']}" for r in pairs]
+        values  = [r['est_dp_gap'] for r in singles] + \
+                  [r['est_dp_gap'] for r in pairs]
+        colors  = [NODE_COLORS[r['auditor_id'] - 1] for r in singles] + \
+                  ['#b0b0b0'] * len(pairs)
+        hatches = [''] * len(singles) + ['//'] * len(pairs)
+
+        x_pos = np.arange(len(labels))
+        for x, val, col, hatch in zip(x_pos, values, colors, hatches):
+            ax.bar(x, val, color=col, edgecolor='white', linewidth=0.8,
+                   width=0.7, hatch=hatch, zorder=3)
+            ax.text(x, val + 0.003, f'{val:.3f}', ha='center', va='bottom',
+                    fontsize=6, rotation=90)
+
+        if singles and pairs:
+            ax.axvline(len(singles) - 0.5, color='gray', linestyle=':', linewidth=1)
+            y_top = max(values) * 1.3
+            ax.text(len(singles) / 2 - 0.5, y_top * 0.97,
+                    'single', ha='center', va='top', fontsize=7, color='gray')
+            ax.text(len(singles) + len(pairs) / 2 - 0.5, y_top * 0.97,
+                    'pairs', ha='center', va='top', fontsize=7, color='gray')
+
+        ax.axhline(true_dp_mv,   color='black', linestyle='--', linewidth=1.5,
+                   label=f'True DP model/val ({true_dp_mv:.3f})', zorder=2)
+        ax.axhline(true_dp_data, color='gray',  linestyle=':',  linewidth=1.5,
+                   label=f'True DP data ({true_dp_data:.3f})', zorder=2)
+
+        ax.set_title(f'Target: Node {target_id}', fontweight='bold')
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(labels, fontsize=7, rotation=45, ha='right')
+        ax.set_ylim(0, max(values + [true_dp_mv, true_dp_data]) * 1.3)
+        ax.legend(fontsize=7)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    axes[0].set_ylabel('Estimated DP Gap')
+    plt.tight_layout()
+    out = os.path.join(PLOT_DIR, f'step5b_collab_vs_single_{PARTITION_ATTR}.png')
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    log.info(f"  ✓ Saved → {out}")
+else:
+    log.warning("  ✗ Plot 7 skipped — no collab_pair_results in results JSON")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
